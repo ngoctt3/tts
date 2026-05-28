@@ -19,7 +19,7 @@ services:
       EDGE_TTS_INTERNAL_TOKEN: ${EDGE_TTS_INTERNAL_TOKEN:-dev-edge-tts-token}
 
       # Public URL base for MP3 links (Nginx serves these)
-      EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-http://localhost:8080/media}
+      EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-https://tts1.truyendich.store/media}
 
       # Internal Redis (inside compose network)
       REDIS_URL: redis://tts-redis:6379/0
@@ -120,8 +120,6 @@ services:
       fastapi:
         condition: service_healthy
     restart: always
-    ports:
-      - "8080:80"
     networks:
       - dokploy-network
       - default
