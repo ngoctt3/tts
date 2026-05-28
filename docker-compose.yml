@@ -1,0 +1,117 @@
+name: tts
+
+services:
+  # ─────────────────────────────────────────────────────────
+  # 1. FastAPI — TTS synthesis engine
+  # ─────────────────────────────────────────────────────────
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tts-api
+    environment:
+      ENV: production
+      LOG_LEVEL: INFO
+      PYTHONPATH: /app
+
+      # Auth
+      EDGE_TTS_INTERNAL_TOKEN: ${EDGE_TTS_INTERNAL_TOKEN:-dev-edge-tts-token}
+
+      # Public URL base for MP3 links (Nginx serves these)
+      EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-http://localhost:8080/media}
+
+      # Internal Redis (inside compose network)
+      REDIS_URL: redis://redis:6379/0
+
+      # Segment metadata
+      EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-259200}
+      EDGE_TTS_SEGMENT_LOCK_SECONDS: ${EDGE_TTS_SEGMENT_LOCK_SECONDS:-180}
+      EDGE_TTS_SEGMENT_WAIT_SECONDS: ${EDGE_TTS_SEGMENT_WAIT_SECONDS:-30}
+      EDGE_TTS_MAX_SEGMENT_CHARS: ${EDGE_TTS_MAX_SEGMENT_CHARS:-8000}
+      EDGE_TTS_FAILED_TEXT_LOG_CHARS: ${EDGE_TTS_FAILED_TEXT_LOG_CHARS:-1200}
+
+      # Storage: local only
+      EDGE_TTS_LOCAL_DIR: /data/edge_tts
+      EDGE_TTS_LOCAL_PREFIX: ${EDGE_TTS_LOCAL_PREFIX:-tts}
+
+      # Cleanup
+      EDGE_TTS_CLEANUP_MAX_AGE_SECONDS: ${EDGE_TTS_CLEANUP_MAX_AGE_SECONDS:-259200}
+      EDGE_TTS_CLEANUP_INTERVAL_SECONDS: ${EDGE_TTS_CLEANUP_INTERVAL_SECONDS:-3600}
+
+      # Workload
+      EDGE_TTS_CONCURRENCY: ${EDGE_TTS_CONCURRENCY:-64}
+      EDGE_TTS_METRICS_CACHE_SECONDS: ${EDGE_TTS_METRICS_CACHE_SECONDS:-10}
+
+      # Upstream synth
+      EDGE_TTS_CONNECT_TIMEOUT: ${EDGE_TTS_CONNECT_TIMEOUT:-8}
+      EDGE_TTS_RECEIVE_TIMEOUT: ${EDGE_TTS_RECEIVE_TIMEOUT:-30}
+      EDGE_TTS_RETRIES: ${EDGE_TTS_RETRIES:-10}
+      EDGE_TTS_RETRY_SLEEP_MIN_SECONDS: ${EDGE_TTS_RETRY_SLEEP_MIN_SECONDS:-0.1}
+      EDGE_TTS_RETRY_SLEEP_MAX_SECONDS: ${EDGE_TTS_RETRY_SLEEP_MAX_SECONDS:-0.2}
+      EDGE_TTS_HEDGE_AFTER_ATTEMPTS: ${EDGE_TTS_HEDGE_AFTER_ATTEMPTS:-4}
+
+      # Optional proxy
+      EDGE_TTS_PROXY_URLS: ${EDGE_TTS_PROXY_URLS:-}
+
+      # Webhook
+      EDGE_TTS_WEBHOOK_TIMEOUT: ${EDGE_TTS_WEBHOOK_TIMEOUT:-10}
+      EDGE_TTS_WEBHOOK_MAX_RETRIES: ${EDGE_TTS_WEBHOOK_MAX_RETRIES:-5}
+
+      LOG_FILE: /var/log/edge-tts/service.log
+    volumes:
+      - media_cache:/data/edge_tts
+      - app_logs:/var/log/edge-tts
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+    restart: always
+
+  # ─────────────────────────────────────────────────────────
+  # 2. Redis — internal cache & lock (independent)
+  # ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: tts-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  # ─────────────────────────────────────────────────────────
+  # 3. Nginx — public entrypoint (serve MP3 + proxy API)
+  # ─────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tts-nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - media_cache:/data/edge_tts:ro
+    depends_on:
+      - fastapi
+    restart: always
+    networks:
+      - dokploy-network
+      - truyendich-network
+      - default
+
+volumes:
+  media_cache:
+  redis_data:
+  app_logs:
+
+networks:
+  default:
+    name: tts-network
+  dokploy-network:
+    external: true
+  truyendich-network:
+    external: true
