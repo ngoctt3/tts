@@ -26,6 +26,12 @@ http {
                     '"$http_referer" "$http_user_agent"';
     access_log /var/log/nginx/access.log main;
 
+    # Dynamically match requested Origin against allowed origins
+    map $http_origin $cors_origin {
+        default "";
+        "~^$ALLOW_ORIGIN$" $http_origin;
+    }
+
     server {
         listen 80;
         server_name _;
@@ -54,7 +60,7 @@ http {
             alias /data/edge_tts/;
 
             # CORS headers — allow any origin (public media)
-            add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN" always;
+            add_header Access-Control-Allow-Origin  $cors_origin always;
             add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
             add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
             add_header Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges" always;
@@ -64,7 +70,7 @@ http {
 
             # Handle preflight requests
             if ($request_method = 'OPTIONS') {
-                add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN";
+                add_header Access-Control-Allow-Origin  $cors_origin;
                 add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS";
                 add_header Access-Control-Allow-Headers "Range, Accept, Content-Type";
                 add_header Access-Control-Max-Age 86400;
@@ -98,12 +104,12 @@ http {
             proxy_read_timeout    180s;
 
             # CORS headers for API
-            add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN" always;
+            add_header Access-Control-Allow-Origin  $cors_origin always;
             add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
             add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID" always;
 
             if ($request_method = 'OPTIONS') {
-                add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN";
+                add_header Access-Control-Allow-Origin  $cors_origin;
                 add_header Access-Control-Allow-Methods "GET, POST, OPTIONS";
                 add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID";
                 add_header Access-Control-Max-Age 86400;
