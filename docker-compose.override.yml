@@ -1,6 +1,0 @@
-name: tts
-
-services:
-  nginx:
-    ports:
-      - "8080:80"

@@ -102,6 +102,8 @@ services:
     depends_on:
       - fastapi
     restart: always
+    ports:
+      - "8080:80"
     networks:
       - dokploy-network
       - truyendich-network
