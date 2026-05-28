@@ -133,11 +133,39 @@ Nginx will be exposed on port `80` (or the port defined in `docker-compose.yml`)
 }
 ```
 
+* **Sample Response (Early Failed / 200 OK)**:
+```json
+{
+  "status": "early_failed",
+  "cache_key": "a4f89d38c2019b87d643efaa8910d65b",
+  "url": null,
+  "duration": null,
+  "bytes": null,
+  "attempts": 4,
+  "provider": "edge-tts",
+  "voice": null,
+  "duration_source": null,
+  "meta_ttl_seconds": 259200,
+  "error": "Edge TTS connection timed out"
+}
+```
+
+> **Note**: `early_failed` means this worker gave up early (after `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` attempts) and the orchestrator should re-dispatch to a different worker. See the [Hedging](#-hedging--early-failure) section below.
+
 ---
 
 ## 🪝 Webhook Callback
 
 When synthesis is complete (or if it fails/skips), the service sends a `POST` request to the provided `webhook_url` containing the standard response structure above.
+
+### Possible `status` values in webhook callbacks:
+
+| Status | Meaning | Orchestrator action |
+| :--- | :--- | :--- |
+| `ready` | Synthesis succeeded. `url` contains the audio file. | Use the audio. |
+| `skipped` | Text had no speakable content (e.g. only punctuation). | Treat as silent/empty segment. |
+| `early_failed` | Worker failed after `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` attempts and gave up early. | **Hedge**: re-dispatch the same segment to a different worker. |
+| `failed` | Worker exhausted all retries and fully failed. | Mark as permanently failed or retry later. |
 
 ### Reliability Features:
 * **Exponential Backoff**: If the client's webhook endpoint fails (e.g. returns 5xx or experiences connection timeouts), the service automatically retries up to 5 times with exponential backoff:
@@ -147,6 +175,40 @@ When synthesis is complete (or if it fails/skips), the service sends a `POST` re
   - Attempt 4: 4s delay
   - Attempt 5: 8s delay
 * **Tracing Headers**: The webhook includes tracing headers `X-Request-ID` and `X-Cache-Key` for easy routing.
+
+---
+
+## 🔀 Hedging / Early Failure
+
+The service implements a **hedging** strategy to improve reliability across multiple worker nodes. Instead of a single worker retrying indefinitely, it fails early and signals the orchestrator to try another worker.
+
+### How it works:
+
+```
+┌──────────────┐      POST /api/tts/segments      ┌──────────────┐
+│              │ ──────────────────────────────────►│   Worker A   │
+│              │                                    │              │
+│              │  webhook: status = "early_failed"  │  (4 attempts │
+│ Orchestrator │ ◄──────────────────────────────────│   failed)    │
+│              │                                    └──────────────┘
+│              │      POST /api/tts/segments
+│              │ ──────────────────────────────────►┌──────────────┐
+│              │                                    │   Worker B   │
+│              │  webhook: status = "ready"          │              │
+│              │ ◄──────────────────────────────────│  (success!)  │
+└──────────────┘                                    └──────────────┘
+```
+
+1. The orchestrator sends a TTS request to **Worker A**.
+2. Worker A tries `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` times (default: 4).
+3. If all attempts fail, Worker A returns `status: "early_failed"` (HTTP 200) and fires the webhook with the same status.
+4. The orchestrator receives `early_failed` and **re-dispatches** the same segment to **Worker B** (a different node).
+5. Worker B processes the request independently.
+
+### Key behaviors:
+- `early_failed` response uses HTTP **200** (not 5xx), so load balancers don't mark the worker as unhealthy.
+- The Redis cache key for `early_failed` segments has a **short TTL (60s)**, so the next worker won't see a stale cached failure.
+- If `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` is set to `0` or is `>= EDGE_TTS_RETRIES`, hedging is disabled and the worker retries all attempts locally.
 
 ---
 
@@ -188,5 +250,7 @@ python scripts/stress_remote_edge_tts.py --url http://127.0.0.1:8080 --token tes
 | `EDGE_TTS_MAX_SEGMENT_CHARS` | `8000` | Maximum character length allowed for a single segment |
 | `EDGE_TTS_CLEANUP_MAX_AGE_SECONDS` | `259200` (3 days) | Expiry limit for audio files deletion |
 | `EDGE_TTS_CLEANUP_INTERVAL_SECONDS` | `3600` (1 hour) | Cleanup scan interval |
+| `EDGE_TTS_RETRIES` | `10` | Maximum local synthesis retry attempts before giving up |
+| `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` | `4` | After this many failed attempts, return `early_failed` so the orchestrator can hedge on another worker. Set to `0` to disable hedging. |
 | `EDGE_TTS_WEBHOOK_TIMEOUT` | `10` | Webhook HTTP timeout (seconds) |
 | `EDGE_TTS_WEBHOOK_MAX_RETRIES` | `5` | Maximum attempts for webhook delivery |

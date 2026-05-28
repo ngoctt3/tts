@@ -7,7 +7,7 @@ import re
 import sys
 import time
 from collections import deque
-from typing import Any, List, Optional
+from typing import Any
 
 from bs4 import BeautifulSoup
 
@@ -28,7 +28,6 @@ DEFAULT_LONG_SEGMENT_CHARS = 300
 DEFAULT_SHORT_SEGMENT_WORDS = 30
 DEFAULT_LONG_SEGMENT_WORDS = 50
 DEFAULT_SHORT_SEGMENT_COUNT = 5
-DEFAULT_PROXY_URLS = [item.strip() for item in os.getenv("EDGE_TTS_PROXY_URLS", "").split(",") if item.strip()]
 RETRY_SLEEP_MIN_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MIN_SECONDS", "0.1"))
 RETRY_SLEEP_MAX_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MAX_SECONDS", "0.2"))
 METRICS_SAMPLE_SIZE = int(os.getenv("EDGE_TTS_METRICS_SAMPLE_SIZE", "1000"))
@@ -70,6 +69,22 @@ SUPPORTED_VOICES = {
 }
 
 
+class EarlyFailedError(Exception):
+    """Raised when synthesis fails after hedge_after_attempts.
+
+    This signals the orchestrator to hedge the request on a different worker
+    instead of continuing to retry locally.
+    """
+
+    def __init__(self, attempts: int, last_error: Exception | None = None):
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"Edge TTS early-failed after {attempts} attempt(s), "
+            f"signaling orchestrator to hedge: {last_error}"
+        )
+
+
 class EdgeTTSService:
     """Stateless Edge TTS engine.
 
@@ -84,7 +99,6 @@ class EdgeTTSService:
         concurrency: int = DEFAULT_TTS_CONCURRENCY,
         retries: int = DEFAULT_TTS_RETRIES,
         hedge_after_attempts: int = DEFAULT_HEDGE_AFTER_ATTEMPTS,
-        proxy_urls: Optional[List[str]] = None,
         short_segment_chars: int = DEFAULT_SHORT_SEGMENT_CHARS,
         long_segment_chars: int = DEFAULT_LONG_SEGMENT_CHARS,
         short_segment_words: int = DEFAULT_SHORT_SEGMENT_WORDS,
@@ -94,7 +108,6 @@ class EdgeTTSService:
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
-        self.proxy_urls = list(proxy_urls if proxy_urls is not None else DEFAULT_PROXY_URLS)
         self.short_segment_chars = max(1, int(short_segment_chars))
         self.long_segment_chars = max(1, int(long_segment_chars))
         self.short_segment_words = max(0, int(short_segment_words))
@@ -106,7 +119,6 @@ class EdgeTTSService:
         self._worker_loop: asyncio.AbstractEventLoop | None = None
         self._worker_tasks: list[asyncio.Task] = []
         self._queue_sequence = 0
-        self._proxy_cursor = 0
         self._service_started_at = time.time()
         self._active_jobs = 0
         self._completed_jobs = 0
@@ -322,66 +334,19 @@ class EdgeTTSService:
                 self._queue.task_done()
 
     async def _synthesize_with_retries(self, *, text: str, voice: str, rate: str, volume: str, pitch: str) -> bytes:
-        if self.proxy_urls and self.hedge_after_attempts == 0:
-            return await self._synthesize_lane_retries(
-                text=text,
-                voice=voice,
-                rate=rate,
-                volume=volume,
-                pitch=pitch,
-                lane="proxy",
-                proxy_url=self._next_proxy_url(),
-                attempts=self.retries,
-            )
+        """Retry synthesis up to self.retries times.
 
-        main_attempts = self.retries
-        if self.proxy_urls and 0 < self.hedge_after_attempts < self.retries:
-            main_attempts = self.hedge_after_attempts
-
-        try:
-            return await self._synthesize_lane_retries(
-                text=text,
-                voice=voice,
-                rate=rate,
-                volume=volume,
-                pitch=pitch,
-                lane="main",
-                proxy_url=None,
-                attempts=main_attempts,
-            )
-        except Exception:
-            remaining = self.retries - main_attempts
-            if not self.proxy_urls or remaining <= 0:
-                raise
-            return await self._synthesize_lane_retries(
-                text=text,
-                voice=voice,
-                rate=rate,
-                volume=volume,
-                pitch=pitch,
-                lane="proxy",
-                proxy_url=self._next_proxy_url(),
-                attempts=max(1, remaining),
-            )
-
-    async def _synthesize_lane_retries(
-        self,
-        *,
-        text: str,
-        voice: str,
-        rate: str,
-        volume: str,
-        pitch: str,
-        lane: str,
-        proxy_url: str | None,
-        attempts: int,
-    ) -> bytes:
+        If hedge_after_attempts is configured (> 0 and < retries), raise
+        EarlyFailedError after that many consecutive failures so the
+        orchestrator can hedge the request on a different worker.
+        """
         last_error: Exception | None = None
-        for attempt in range(1, max(1, attempts) + 1):
+        lane = "main"
+        for attempt in range(1, self.retries + 1):
             self._synth_attempts += 1
             self._lane_attempts[lane] = self._lane_attempts.get(lane, 0) + 1
             try:
-                audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy_url=proxy_url)
+                audio = await self._synthesize_once(text, voice, rate, volume, pitch)
                 if len(audio) < 512:
                     raise RuntimeError("Edge TTS returned an empty audio segment")
                 self._lane_successes[lane] = self._lane_successes.get(lane, 0) + 1
@@ -395,18 +360,24 @@ class EdgeTTSService:
                         "edge_tts_synthesize_attempt_failed",
                         lane=lane,
                         attempt=attempt,
-                        max_attempts=attempts,
-                        proxy_enabled=bool(proxy_url),
+                        max_attempts=self.retries,
                         voice=voice,
                         text_length=len(text),
                         text_preview=text[:120],
                         error=str(exc),
                     )
-                if attempt < attempts and RETRY_SLEEP_MAX_SECONDS > 0:
+                # Early-fail: signal orchestrator to hedge on another worker
+                if (
+                    0 < self.hedge_after_attempts < self.retries
+                    and attempt >= self.hedge_after_attempts
+                ):
+                    raise EarlyFailedError(attempt, last_error) from last_error
+
+                if attempt < self.retries and RETRY_SLEEP_MAX_SECONDS > 0:
                     sleep_min = max(0.0, min(RETRY_SLEEP_MIN_SECONDS, RETRY_SLEEP_MAX_SECONDS))
                     sleep_max = max(sleep_min, RETRY_SLEEP_MAX_SECONDS)
                     await asyncio.sleep(random.uniform(sleep_min, sleep_max))
-        raise RuntimeError(f"Edge TTS failed after {attempts} {lane} attempt(s): {last_error}")
+        raise RuntimeError(f"Edge TTS failed after {self.retries} attempt(s): {last_error}")
 
     async def _synthesize_once(
         self,
@@ -415,8 +386,6 @@ class EdgeTTSService:
         rate: str,
         volume: str,
         pitch: str,
-        *,
-        proxy_url: str | None,
     ) -> bytes:
         import edge_tts
 
@@ -427,7 +396,6 @@ class EdgeTTSService:
             rate=rate,
             volume=volume,
             pitch=pitch,
-            proxy=proxy_url,
             connect_timeout=DEFAULT_CONNECT_TIMEOUT,
             receive_timeout=DEFAULT_RECEIVE_TIMEOUT,
         )
@@ -449,13 +417,6 @@ class EdgeTTSService:
                 self._record_stage_metric(stage, started_at, started_cpu)
 
         return await asyncio.to_thread(run)
-
-    def _next_proxy_url(self) -> str | None:
-        if not self.proxy_urls:
-            return None
-        proxy_url = self.proxy_urls[self._proxy_cursor % len(self.proxy_urls)]
-        self._proxy_cursor += 1
-        return proxy_url
 
     def _split_blocks_with_tiers(self, blocks: list[str], segment_index_offset: int = 0) -> list[str]:
         segments: list[str] = []

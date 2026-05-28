@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.logger import get_logger
-from app.services.edge_tts import VOICE_ALIASES, edge_tts_service
+from app.services.edge_tts import VOICE_ALIASES, EarlyFailedError, edge_tts_service
 
 
 log = get_logger().bind(service="remote_edge_tts")
@@ -186,7 +186,7 @@ class TTSSegmentRequest(BaseModel):
 
 
 class TTSSegmentResponse(BaseModel):
-    status: Literal["ready", "generating", "deferred", "dead_letter", "skipped", "failed"]
+    status: Literal["ready", "generating", "deferred", "dead_letter", "skipped", "failed", "early_failed"]
     cache_key: str
     url: str | None = None
     duration: float | None = None
@@ -499,7 +499,7 @@ def _segment_response_from_meta(cache_key: str, meta: dict[str, Any]) -> TTSSegm
             return None
 
     status = str(meta.get("status") or "generating")
-    if status not in {"ready", "generating", "deferred", "dead_letter", "skipped", "failed"}:
+    if status not in {"ready", "generating", "deferred", "dead_letter", "skipped", "failed", "early_failed"}:
         status = "generating"
     return TTSSegmentResponse(
         status=status,  # type: ignore[arg-type]
@@ -590,6 +590,39 @@ async def _synthesize_segment_to_meta(
         }
         await _write_segment_meta(client, body.cache_key, meta)
         return _segment_response_from_meta(body.cache_key, meta)
+
+    except EarlyFailedError as exc:
+        # Worker exhausted hedge_after_attempts — signal orchestrator to
+        # hedge this segment on a different worker.
+        meta = {
+            "status": "early_failed",
+            "cache_key": body.cache_key,
+            "provider": "edge-tts",
+            "last_error": str(exc)[:500],
+            "attempts": str(exc.attempts),
+            "failed_text_length": str(len(text)),
+            "failed_text_preview": _failed_text_preview(text),
+            "updated_at": str(int(time.time())),
+            "request_id": request_id,
+            "trace_id": trace_id,
+        }
+        # Use a short TTL so the orchestrator can re-dispatch immediately
+        pipe = client.pipeline()
+        pipe.hset(_segment_meta_key(body.cache_key), mapping=meta)
+        pipe.expire(_segment_meta_key(body.cache_key), 60)
+        await pipe.execute()
+        log.warning(
+            "edge_tts_segment_early_failed",
+            request_id=request_id,
+            trace_id=trace_id,
+            cache_key=body.cache_key,
+            voice=body.voice,
+            attempts=exc.attempts,
+            text_length=len(text),
+            error=str(exc.last_error),
+            elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        )
+        raise
 
     except Exception as exc:
         meta = {
@@ -813,6 +846,20 @@ async def create_tts_segment(
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EarlyFailedError as exc:
+        # Return early_failed so the orchestrator can hedge on another worker
+        early_response = TTSSegmentResponse(
+            status="early_failed",
+            cache_key=body.cache_key,
+            attempts=exc.attempts,
+            error=str(exc.last_error)[:500] if exc.last_error else "early_failed",
+        )
+        _fire_webhook_background(body.webhook_url, early_response, request_id=request_id)
+        return JSONResponse(
+            status_code=200,
+            content=early_response.model_dump(mode="json"),
+            headers={"Cache-Control": "no-store", "X-Request-ID": request_id},
+        )
     except Exception as exc:
         # Fire failed webhook
         failed_response = TTSSegmentResponse(
