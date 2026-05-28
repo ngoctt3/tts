@@ -1,0 +1,123 @@
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile    on;
+    tcp_nopush  on;
+    tcp_nodelay on;
+
+    keepalive_timeout  65;
+    client_max_body_size 0;
+
+    # Gzip for JSON API responses
+    gzip on;
+    gzip_types application/json;
+    gzip_min_length 256;
+
+    # Access log format
+    log_format main '$remote_addr - $remote_user [$time_local] '
+                    '"$request" $status $body_bytes_sent '
+                    '"$http_referer" "$http_user_agent"';
+    access_log /var/log/nginx/access.log main;
+
+    server {
+        listen 80;
+        server_name _;
+
+        # ──────────────────────────────────────────────────
+        # 1. Health check (for load balancers / monitoring)
+        # ──────────────────────────────────────────────────
+        location = /health {
+            access_log off;
+            proxy_pass http://fastapi:8100/health;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_connect_timeout 3s;
+            proxy_send_timeout    5s;
+            proxy_read_timeout    5s;
+        }
+
+        # ──────────────────────────────────────────────────
+        # 2. Serve MP3 static files with CORS
+        # ──────────────────────────────────────────────────
+        location /media/ {
+            alias /data/edge_tts/;
+
+            # CORS headers — allow any origin (public media)
+            add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN" always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
+            add_header Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges" always;
+
+            # Cache headers
+            add_header Cache-Control "public, max-age=259200, immutable" always;
+
+            # Handle preflight requests
+            if ($request_method = 'OPTIONS') {
+                add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN";
+                add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS";
+                add_header Access-Control-Allow-Headers "Range, Accept, Content-Type";
+                add_header Access-Control-Max-Age 86400;
+                add_header Content-Length 0;
+                add_header Content-Type text/plain;
+                return 204;
+            }
+
+            # Enable byte-range requests for audio seeking
+            add_header Accept-Ranges bytes always;
+
+            types {
+                audio/mpeg mp3;
+            }
+        }
+
+        # ──────────────────────────────────────────────────
+        # 3. Proxy API requests to FastAPI backend
+        # ──────────────────────────────────────────────────
+        location /api/ {
+            proxy_pass http://fastapi:8100/api/;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # Long timeout for TTS synthesis (wait mode)
+            proxy_connect_timeout 10s;
+            proxy_send_timeout    60s;
+            proxy_read_timeout    180s;
+
+            # CORS headers for API
+            add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN" always;
+            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID" always;
+
+            if ($request_method = 'OPTIONS') {
+                add_header Access-Control-Allow-Origin  "$ALLOW_ORIGIN";
+                add_header Access-Control-Allow-Methods "GET, POST, OPTIONS";
+                add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID";
+                add_header Access-Control-Max-Age 86400;
+                add_header Content-Length 0;
+                add_header Content-Type text/plain;
+                return 204;
+            }
+        }
+
+        # ──────────────────────────────────────────────────
+        # 4. Deny everything else
+        # ──────────────────────────────────────────────────
+        location / {
+            return 403 "Forbidden";
+        }
+    }
+}

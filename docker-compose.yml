@@ -39,7 +39,7 @@ services:
       EDGE_TTS_CLEANUP_INTERVAL_SECONDS: ${EDGE_TTS_CLEANUP_INTERVAL_SECONDS:-3600}
 
       # Workload
-      EDGE_TTS_CONCURRENCY: ${EDGE_TTS_CONCURRENCY:-64}
+      EDGE_TTS_CONCURRENCY: ${EDGE_TTS_CONCURRENCY:-16}
       EDGE_TTS_METRICS_CACHE_SECONDS: ${EDGE_TTS_METRICS_CACHE_SECONDS:-10}
 
       # Upstream synth
@@ -92,8 +92,12 @@ services:
   nginx:
     image: nginx:1.27-alpine
     container_name: tts-nginx
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: ALLOW_ORIGIN
+      ALLOW_ORIGIN: ${ALLOW_ORIGIN:-https://truyendich.ai}
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - media_cache:/data/edge_tts:ro
     depends_on:
       - fastapi

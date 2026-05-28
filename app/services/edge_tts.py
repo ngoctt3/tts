@@ -18,7 +18,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-DEFAULT_TTS_CONCURRENCY = int(os.getenv("EDGE_TTS_CONCURRENCY", "32"))
+DEFAULT_TTS_CONCURRENCY = int(os.getenv("EDGE_TTS_CONCURRENCY", "16"))
 DEFAULT_TTS_RETRIES = int(os.getenv("EDGE_TTS_RETRIES", "10"))
 DEFAULT_HEDGE_AFTER_ATTEMPTS = int(os.getenv("EDGE_TTS_HEDGE_AFTER_ATTEMPTS", "4"))
 DEFAULT_CONNECT_TIMEOUT = int(os.getenv("EDGE_TTS_CONNECT_TIMEOUT", "8"))
