@@ -18,7 +18,7 @@ services:
       EDGE_TTS_INTERNAL_TOKEN: ${EDGE_TTS_INTERNAL_TOKEN:-dev-edge-tts-token}
 
       # Public URL base for MP3 links (Nginx serves these)
-      EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-http://tts1.truyendich.store/media}
+      EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-https://fallen-euros-enjoy-ivory.trycloudflare.com/media}
 
       # Internal Redis (inside compose network)
       REDIS_URL: redis://redis:6379/0
