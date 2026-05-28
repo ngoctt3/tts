@@ -78,6 +78,19 @@ LOCAL_PREFIX = os.getenv("EDGE_TTS_LOCAL_PREFIX", "tts").strip("/")
 CLEANUP_MAX_AGE_SECONDS = _env_int("EDGE_TTS_CLEANUP_MAX_AGE_SECONDS", 3 * 24 * 3600)
 CLEANUP_INTERVAL_SECONDS = _env_int("EDGE_TTS_CLEANUP_INTERVAL_SECONDS", 3600)
 
+# Ensure Redis key TTL is strictly less than cleanup max age to prevent serving cached metadata for deleted files
+if SEGMENT_META_TTL_SECONDS >= CLEANUP_MAX_AGE_SECONDS:
+    buffer = max(1, int(CLEANUP_MAX_AGE_SECONDS * 0.1))
+    adjusted_ttl = max(1, CLEANUP_MAX_AGE_SECONDS - buffer)
+    log.warning(
+        "adjusting_segment_meta_ttl",
+        original_ttl=SEGMENT_META_TTL_SECONDS,
+        cleanup_max_age=CLEANUP_MAX_AGE_SECONDS,
+        adjusted_ttl=adjusted_ttl,
+        reason="Redis key TTL must be less than cleanup max age to avoid stale cached links",
+    )
+    SEGMENT_META_TTL_SECONDS = adjusted_ttl
+
 # Webhook
 WEBHOOK_TIMEOUT = _env_int("EDGE_TTS_WEBHOOK_TIMEOUT", 10)
 WEBHOOK_MAX_RETRIES = _env_int("EDGE_TTS_WEBHOOK_MAX_RETRIES", 5)

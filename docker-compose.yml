@@ -24,7 +24,7 @@ services:
       REDIS_URL: redis://redis:6379/0
 
       # Segment metadata
-      EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-259200}
+      EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-233280}
       EDGE_TTS_SEGMENT_LOCK_SECONDS: ${EDGE_TTS_SEGMENT_LOCK_SECONDS:-180}
       EDGE_TTS_SEGMENT_WAIT_SECONDS: ${EDGE_TTS_SEGMENT_WAIT_SECONDS:-30}
       EDGE_TTS_MAX_SEGMENT_CHARS: ${EDGE_TTS_MAX_SEGMENT_CHARS:-8000}
@@ -95,7 +95,7 @@ services:
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
       NGINX_ENVSUBST_FILTER: ALLOW_ORIGIN
-      ALLOW_ORIGIN: ${ALLOW_ORIGIN:-https://truyendich.ai}
+      ALLOW_ORIGIN: ${ALLOW_ORIGIN:-https://truyendich.ai,http://localhost:3000}
     volumes:
       - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - media_cache:/data/edge_tts:ro
