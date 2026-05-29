@@ -21,10 +21,10 @@ services:
       EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-http://localhost:8080/media}
 
       # Internal Redis (inside compose network)
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://tts-redis:6379/0
 
       # Segment metadata
-      EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-233280}
+      EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-43200}
       EDGE_TTS_SEGMENT_LOCK_SECONDS: ${EDGE_TTS_SEGMENT_LOCK_SECONDS:-180}
       EDGE_TTS_SEGMENT_WAIT_SECONDS: ${EDGE_TTS_SEGMENT_WAIT_SECONDS:-30}
       EDGE_TTS_MAX_SEGMENT_CHARS: ${EDGE_TTS_MAX_SEGMENT_CHARS:-8000}
@@ -35,11 +35,11 @@ services:
       EDGE_TTS_LOCAL_PREFIX: ${EDGE_TTS_LOCAL_PREFIX:-tts}
 
       # Cleanup
-      EDGE_TTS_CLEANUP_MAX_AGE_SECONDS: ${EDGE_TTS_CLEANUP_MAX_AGE_SECONDS:-259200}
+      EDGE_TTS_CLEANUP_MAX_AGE_SECONDS: ${EDGE_TTS_CLEANUP_MAX_AGE_SECONDS:-46800}
       EDGE_TTS_CLEANUP_INTERVAL_SECONDS: ${EDGE_TTS_CLEANUP_INTERVAL_SECONDS:-3600}
 
       # Workload
-      EDGE_TTS_CONCURRENCY: ${EDGE_TTS_CONCURRENCY:-16}
+      EDGE_TTS_CONCURRENCY: ${EDGE_TTS_CONCURRENCY:-64}
       EDGE_TTS_METRICS_CACHE_SECONDS: ${EDGE_TTS_METRICS_CACHE_SECONDS:-10}
 
       # Upstream synth
@@ -59,21 +59,27 @@ services:
       - media_cache:/data/edge_tts
       - app_logs:/var/log/edge-tts
     depends_on:
-      redis:
+      tts-redis:
         condition: service_healthy
     networks:
       - dokploy-network
       - truyendich-network
       - default
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
 
   # ─────────────────────────────────────────────────────────
   # 2. Redis — internal cache & lock (independent)
   # ─────────────────────────────────────────────────────────
-  redis:
+  tts-redis:
     image: redis:7-alpine
     container_name: tts-redis
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     networks:
@@ -84,6 +90,12 @@ services:
       timeout: 3s
       retries: 5
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+        reservations:
+          memory: 16M
 
   # ─────────────────────────────────────────────────────────
   # 3. Nginx — public entrypoint (serve MP3 + proxy API)
@@ -107,6 +119,12 @@ services:
       - dokploy-network
       - truyendich-network
       - default
+    deploy:
+      resources:
+        limits:
+          memory: 50M
+        reservations:
+          memory: 8M
 
 volumes:
   media_cache:

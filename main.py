@@ -214,26 +214,36 @@ async def require_internal_token(
 # File cleanup task
 # ──────────────────────────────────────────────────────────────────────
 
+def _sync_cleanup_files(directory: str, max_age_seconds: int) -> tuple[int, int]:
+    cutoff = time.time() - max_age_seconds
+    root = Path(directory)
+    deleted_count = 0
+    total_bytes_freed = 0
+    log.info(f"Cleaning up files in {directory} older than {max_age_seconds} seconds")
+    if not root.exists():
+        return 0, 0
+    for mp3_file in root.rglob("*.mp3"):
+        try:
+            stat = mp3_file.stat()
+            if stat.st_mtime < cutoff:
+                file_size = stat.st_size
+                mp3_file.unlink(missing_ok=True)
+                deleted_count += 1
+                total_bytes_freed += file_size
+        except OSError:
+            pass
+    return deleted_count, total_bytes_freed
+
+
 async def _cleanup_old_files() -> None:
     """Periodically scan media directory and delete files older than CLEANUP_MAX_AGE_SECONDS."""
     log.info(f"Starting cleanup task with interval {CLEANUP_INTERVAL_SECONDS} seconds")
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-            cutoff = time.time() - CLEANUP_MAX_AGE_SECONDS
-            root = Path(LOCAL_DIR)
-            deleted_count = 0
-            total_bytes_freed = 0
-            for mp3_file in root.rglob("*.mp3"):
-                try:
-                    stat = mp3_file.stat()
-                    if stat.st_mtime < cutoff:
-                        file_size = stat.st_size
-                        mp3_file.unlink(missing_ok=True)
-                        deleted_count += 1
-                        total_bytes_freed += file_size
-                except OSError:
-                    pass
+            deleted_count, total_bytes_freed = await asyncio.to_thread(
+                _sync_cleanup_files, LOCAL_DIR, CLEANUP_MAX_AGE_SECONDS
+            )
             if deleted_count > 0:
                 log.success(
                     "edge_tts_cleanup_completed",
