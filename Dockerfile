@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy standalone application code
 COPY app/ ./app/
 COPY main.py ./main.py
+COPY stress_test.py ./stress_test.py
 COPY entrypoint.sh /entrypoint.sh
 
 RUN mkdir -p /var/log/edge-tts /data/edge_tts/segments \
@@ -29,4 +30,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3).read()"
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["gunicorn", "main:app", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8100", "--timeout", "180", "--graceful-timeout", "30"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1", "--timeout-keep-alive", "180"]
