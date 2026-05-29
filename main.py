@@ -11,6 +11,8 @@ and scale horizontally by deploying multiple nodes behind a load balancer.
 import asyncio
 import os
 import re
+import signal
+import sys
 import time
 import threading
 from contextlib import asynccontextmanager
@@ -153,8 +155,14 @@ media_storage = LocalDiskStorage(
 # ──────────────────────────────────────────────────────────────────────
 
 redis_pool: redis.Redis | None = None
+webhook_client: httpx.AsyncClient | None = None
 metrics_cache: dict = {"expires_at": 0.0, "payload": None}
 background_segment_tasks: set[asyncio.Task] = set()
+
+# Graceful shutdown state
+is_shutting_down = False
+health_5xx_responded = False
+shutdown_initiated = False
 
 # ──────────────────────────────────────────────────────────────────────
 # Pydantic models
@@ -214,26 +222,36 @@ async def require_internal_token(
 # File cleanup task
 # ──────────────────────────────────────────────────────────────────────
 
+def _sync_cleanup_files(directory: str, max_age_seconds: int) -> tuple[int, int]:
+    cutoff = time.time() - max_age_seconds
+    root = Path(directory)
+    deleted_count = 0
+    total_bytes_freed = 0
+    log.info(f"Cleaning up files in {directory} older than {max_age_seconds} seconds")
+    if not root.exists():
+        return 0, 0
+    for mp3_file in root.rglob("*.mp3"):
+        try:
+            stat = mp3_file.stat()
+            if stat.st_mtime < cutoff:
+                file_size = stat.st_size
+                mp3_file.unlink(missing_ok=True)
+                deleted_count += 1
+                total_bytes_freed += file_size
+        except OSError:
+            pass
+    return deleted_count, total_bytes_freed
+
+
 async def _cleanup_old_files() -> None:
     """Periodically scan media directory and delete files older than CLEANUP_MAX_AGE_SECONDS."""
     log.info(f"Starting cleanup task with interval {CLEANUP_INTERVAL_SECONDS} seconds")
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-            cutoff = time.time() - CLEANUP_MAX_AGE_SECONDS
-            root = Path(LOCAL_DIR)
-            deleted_count = 0
-            total_bytes_freed = 0
-            for mp3_file in root.rglob("*.mp3"):
-                try:
-                    stat = mp3_file.stat()
-                    if stat.st_mtime < cutoff:
-                        file_size = stat.st_size
-                        mp3_file.unlink(missing_ok=True)
-                        deleted_count += 1
-                        total_bytes_freed += file_size
-                except OSError:
-                    pass
+            deleted_count, total_bytes_freed = await asyncio.to_thread(
+                _sync_cleanup_files, LOCAL_DIR, CLEANUP_MAX_AGE_SECONDS
+            )
             if deleted_count > 0:
                 log.success(
                     "edge_tts_cleanup_completed",
@@ -248,6 +266,21 @@ async def _cleanup_old_files() -> None:
             log.warning("edge_tts_cleanup_error", error=str(exc))
 
 
+async def _periodic_gc_collector() -> None:
+    """Periodically run Python garbage collection to free reference cycles and fragmentation."""
+    import gc
+    log.info("Starting periodic garbage collection task")
+    while True:
+        try:
+            await asyncio.sleep(600)  # Every 10 minutes
+            collected = await asyncio.to_thread(gc.collect)
+            log.debug("periodic_gc_completed", collected_objects=collected)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("periodic_gc_error", error=str(exc))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Webhook sender
 # ──────────────────────────────────────────────────────────────────────
@@ -260,34 +293,37 @@ async def _send_webhook(
     cache_key: str,
 ) -> None:
     """POST the payload to the webhook URL with exponential backoff retry."""
+    global webhook_client
+    if webhook_client is None:
+        limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
+        webhook_client = httpx.AsyncClient(limits=limits, timeout=WEBHOOK_TIMEOUT)
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-                response = await client.post(
-                    webhook_url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Request-ID": request_id,
-                        "X-Cache-Key": cache_key,
-                    },
-                )
-                if response.status_code < 400:
-                    log.debug(
-                        "edge_tts_webhook_sent",
-                        request_id=request_id,
-                        cache_key=cache_key,
-                        status_code=response.status_code,
-                        attempt=attempt,
-                    )
-                    return
-                log.warning(
-                    "edge_tts_webhook_http_error",
+            response = await webhook_client.post(
+                webhook_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Request-ID": request_id,
+                    "X-Cache-Key": cache_key,
+                },
+            )
+            if response.status_code < 400:
+                log.debug(
+                    "edge_tts_webhook_sent",
                     request_id=request_id,
                     cache_key=cache_key,
                     status_code=response.status_code,
                     attempt=attempt,
                 )
+                return
+            log.warning(
+                "edge_tts_webhook_http_error",
+                request_id=request_id,
+                cache_key=cache_key,
+                status_code=response.status_code,
+                attempt=attempt,
+            )
         except Exception as exc:
             log.warning(
                 "edge_tts_webhook_failed",
@@ -326,12 +362,142 @@ def _fire_webhook_background(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Graceful Shutdown Signal Handling
+# ──────────────────────────────────────────────────────────────────────
+
+async def monitor_graceful_shutdown(sig: int, trigger_original_handler: Any) -> None:
+    global shutdown_initiated
+    if shutdown_initiated:
+        return
+    shutdown_initiated = True
+
+    log.info(
+        "graceful_shutdown_started",
+        active_tasks=len(background_segment_tasks),
+        health_5xx_responded=health_5xx_responded,
+        signal=sig,
+    )
+
+    start_time = time.perf_counter()
+    while True:
+        active_count = len(background_segment_tasks)
+        if health_5xx_responded and active_count == 0:
+            break
+
+        elapsed = time.perf_counter() - start_time
+        if int(elapsed) % 5 == 0:
+            log.info(
+                "waiting_for_graceful_shutdown",
+                elapsed_seconds=round(elapsed, 1),
+                active_tasks=active_count,
+                health_5xx_responded=health_5xx_responded,
+            )
+        await asyncio.sleep(0.5)
+
+    log.info(
+        "graceful_shutdown_conditions_met",
+        total_wait_seconds=round(time.perf_counter() - start_time, 2),
+    )
+    trigger_original_handler(sig)
+
+
+def setup_shutdown_handlers() -> None:
+    import signal
+    loop = asyncio.get_running_loop()
+    signals = [signal.SIGTERM, signal.SIGINT]
+
+    # Save existing loop-level handlers (Unix-specific)
+    loop_handlers = {}
+    for sig in signals:
+        try:
+            if hasattr(loop, "_signal_handlers") and sig in loop._signal_handlers:
+                loop_handlers[sig] = loop._signal_handlers[sig]
+        except Exception:
+            pass
+
+    # Save existing OS-level handlers
+    os_handlers = {}
+    for sig in signals:
+        try:
+            os_handlers[sig] = signal.getsignal(sig)
+        except ValueError:
+            pass
+
+    def trigger_original_handler(sig: int) -> None:
+        # Restore loop handler if it existed
+        if sig in loop_handlers:
+            try:
+                callback, args = loop_handlers[sig]
+                loop.add_signal_handler(sig, callback, *args)
+                loop.call_soon(callback, *args)
+                return
+            except Exception as exc:
+                log.warning("failed_to_restore_loop_handler", error=str(exc))
+
+        # Restore OS handler if it existed
+        if sig in os_handlers:
+            try:
+                signal.signal(sig, os_handlers[sig])
+                os.kill(os.getpid(), sig)
+                return
+            except Exception as exc:
+                log.warning("failed_to_restore_os_handler", error=str(exc))
+
+        # Fallback shutdown
+        log.warning("shutdown_fallback_exit")
+        sys.exit(0)
+
+    def loop_signal_callback(sig: int) -> None:
+        global is_shutting_down
+        if not is_shutting_down:
+            is_shutting_down = True
+            log.info("shutdown_loop_signal_received", signal=sig)
+            asyncio.create_task(monitor_graceful_shutdown(sig, trigger_original_handler))
+        else:
+            log.warning("force_shutdown_loop_signal_received")
+            trigger_original_handler(sig)
+
+    def os_signal_handler(sig: int, frame: Any) -> None:
+        global is_shutting_down
+        if not is_shutting_down:
+            is_shutting_down = True
+            log.info("shutdown_os_signal_received", signal=sig)
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(monitor_graceful_shutdown(sig, trigger_original_handler))
+            )
+        else:
+            log.warning("force_shutdown_os_signal_received")
+            trigger_original_handler(sig)
+
+    for sig in signals:
+        registered_loop = False
+        try:
+            if sig in loop_handlers:
+                loop.remove_signal_handler(sig)
+                loop.add_signal_handler(sig, loop_signal_callback, sig)
+                registered_loop = True
+        except (NotImplementedError, AttributeError, ValueError):
+            pass
+
+        if not registered_loop:
+            try:
+                signal.signal(sig, os_signal_handler)
+            except ValueError:
+                pass
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Lifespan
 # ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global webhook_client
+    setup_shutdown_handlers()
     cleanup_task = asyncio.create_task(_cleanup_old_files())
+    gc_task = asyncio.create_task(_periodic_gc_collector())
+    limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
+    webhook_client = httpx.AsyncClient(limits=limits, timeout=WEBHOOK_TIMEOUT)
     log.info(
         "remote_edge_tts_started",
         public_base_url=PUBLIC_BASE_URL,
@@ -343,12 +509,15 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         cleanup_task.cancel()
+        gc_task.cancel()
         tasks = list(background_segment_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await edge_tts_service.shutdown()
+        if webhook_client is not None:
+            await webhook_client.aclose()
         if redis_pool is not None:
             await redis_pool.aclose()
 
@@ -685,6 +854,19 @@ async def _synthesize_segment_background(
 
 @app.get("/health")
 async def health():
+    if is_shutting_down:
+        global health_5xx_responded
+        health_5xx_responded = True
+        log.info("health_check_during_shutdown_served_5xx")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "shutting_down",
+                "service": "remote-edge-tts",
+                "message": "Service is shutting down gracefully"
+            }
+        )
+
     redis_ok = True
     redis_error = None
     try:
