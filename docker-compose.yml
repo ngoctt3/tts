@@ -62,6 +62,8 @@ services:
       redis:
         condition: service_healthy
     networks:
+      - dokploy-network
+      - truyendich-network
       - default
     restart: always
 

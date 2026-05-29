@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.logger import get_logger
-from app.services.edge_tts import VOICE_ALIASES, EarlyFailedError, edge_tts_service
+from app.services.edge_tts import VOICE_ALIASES, edge_tts_service
 
 
 log = get_logger().bind(service="remote_edge_tts")
@@ -67,7 +67,6 @@ FAILED_TEXT_LOG_CHARS = _env_int("EDGE_TTS_FAILED_TEXT_LOG_CHARS", 1200)
 FORCE_FAIL_SEGMENT_INDEX = _env_int("EDGE_TTS_FORCE_FAIL_SEGMENT_INDEX", -1)
 SEGMENT_META_TTL_SECONDS = _env_int("EDGE_TTS_SEGMENT_META_TTL_SECONDS", 3 * 24 * 3600)
 SEGMENT_LOCK_SECONDS = _env_int("EDGE_TTS_SEGMENT_LOCK_SECONDS", 180)
-SEGMENT_WAIT_SECONDS = _env_float("EDGE_TTS_SEGMENT_WAIT_SECONDS", 30.0)
 METRICS_CACHE_SECONDS = _env_float("EDGE_TTS_METRICS_CACHE_SECONDS", 2.0)
 
 # Local storage
@@ -178,7 +177,6 @@ class TTSSegmentRequest(BaseModel):
     rate: str = "+0%"
     volume: str = "+0%"
     pitch: str = "+0Hz"
-    wait: bool = True
     priority_score: float = 0.0
     time_to_play_ms: float = 0.0
     trace: TTSSegmentTrace
@@ -218,6 +216,7 @@ async def require_internal_token(
 
 async def _cleanup_old_files() -> None:
     """Periodically scan media directory and delete files older than CLEANUP_MAX_AGE_SECONDS."""
+    log.info(f"Starting cleanup task with interval {CLEANUP_INTERVAL_SECONDS} seconds")
     while True:
         try:
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
@@ -236,7 +235,7 @@ async def _cleanup_old_files() -> None:
                 except OSError:
                     pass
             if deleted_count > 0:
-                log.info(
+                log.success(
                     "edge_tts_cleanup_completed",
                     deleted_files=deleted_count,
                     freed_bytes=total_bytes_freed,
@@ -470,21 +469,6 @@ async def _release_segment_lock(client: redis.Redis, lock_key: str, lock_token: 
         await client.delete(lock_key)
 
 
-async def _wait_for_ready_segment(client: redis.Redis, cache_key: str, wait: bool) -> TTSSegmentResponse | None:
-    if not wait:
-        return None
-    deadline = time.monotonic() + max(0.0, SEGMENT_WAIT_SECONDS)
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.25)
-        cached = await client.hgetall(_segment_meta_key(cache_key))
-        status = cached.get("status")
-        if status == "ready" and cached.get("url"):
-            return _segment_response_from_meta(cache_key, cached)
-        if status in {"failed", "deferred"}:
-            return _segment_response_from_meta(cache_key, cached)
-    return None
-
-
 def _segment_response_from_meta(cache_key: str, meta: dict[str, Any]) -> TTSSegmentResponse:
     def as_float(value: Any) -> float | None:
         try:
@@ -556,6 +540,48 @@ async def _synthesize_segment_to_meta(
             await _write_segment_meta(client, body.cache_key, meta)
             return _segment_response_from_meta(body.cache_key, meta)
 
+        async def _on_early_failed(attempt: int, last_error: Exception | None) -> None:
+            """Callback fired once when hedge_after_attempts is reached.
+
+            Writes short-TTL early_failed meta to Redis so the orchestrator
+            can re-dispatch immediately, and fires an early_failed webhook.
+            The edge worker continues retrying after this callback returns.
+            """
+            ef_meta = {
+                "status": "early_failed",
+                "cache_key": body.cache_key,
+                "provider": "edge-tts",
+                "last_error": str(last_error)[:500] if last_error else "early_failed",
+                "attempts": str(attempt),
+                "failed_text_length": str(len(text)),
+                "failed_text_preview": _failed_text_preview(text),
+                "updated_at": str(int(time.time())),
+                "request_id": request_id,
+                "trace_id": trace_id,
+            }
+            pipe = client.pipeline()
+            pipe.hset(_segment_meta_key(body.cache_key), mapping=ef_meta)
+            pipe.expire(_segment_meta_key(body.cache_key), 60)
+            await pipe.execute()
+            log.warning(
+                "edge_tts_segment_early_failed",
+                request_id=request_id,
+                trace_id=trace_id,
+                cache_key=body.cache_key,
+                voice=body.voice,
+                attempts=attempt,
+                text_length=len(text),
+                error=str(last_error),
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+            )
+            early_response = TTSSegmentResponse(
+                status="early_failed",
+                cache_key=body.cache_key,
+                attempts=attempt,
+                error=str(last_error)[:500] if last_error else "early_failed",
+            )
+            _fire_webhook_background(body.webhook_url, early_response, request_id=request_id)
+
         audio, duration, duration_source, voice_id = await edge_tts_service.synthesize_text_bytes(
             text=text,
             voice=body.voice,
@@ -565,6 +591,7 @@ async def _synthesize_segment_to_meta(
             priority_score=body.priority_score,
             time_to_play_ms=body.time_to_play_ms,
             trace_id=trace_id,
+            on_early_failed=_on_early_failed,
         )
 
         # Write to local disk
@@ -591,38 +618,6 @@ async def _synthesize_segment_to_meta(
         await _write_segment_meta(client, body.cache_key, meta)
         return _segment_response_from_meta(body.cache_key, meta)
 
-    except EarlyFailedError as exc:
-        # Worker exhausted hedge_after_attempts — signal orchestrator to
-        # hedge this segment on a different worker.
-        meta = {
-            "status": "early_failed",
-            "cache_key": body.cache_key,
-            "provider": "edge-tts",
-            "last_error": str(exc)[:500],
-            "attempts": str(exc.attempts),
-            "failed_text_length": str(len(text)),
-            "failed_text_preview": _failed_text_preview(text),
-            "updated_at": str(int(time.time())),
-            "request_id": request_id,
-            "trace_id": trace_id,
-        }
-        # Use a short TTL so the orchestrator can re-dispatch immediately
-        pipe = client.pipeline()
-        pipe.hset(_segment_meta_key(body.cache_key), mapping=meta)
-        pipe.expire(_segment_meta_key(body.cache_key), 60)
-        await pipe.execute()
-        log.warning(
-            "edge_tts_segment_early_failed",
-            request_id=request_id,
-            trace_id=trace_id,
-            cache_key=body.cache_key,
-            voice=body.voice,
-            attempts=exc.attempts,
-            text_length=len(text),
-            error=str(exc.last_error),
-            elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
-        )
-        raise
 
     except Exception as exc:
         meta = {
@@ -795,9 +790,11 @@ async def create_tts_segment(
     lock_acquired = await client.set(lock_key, lock_token, ex=SEGMENT_LOCK_SECONDS, nx=True)
 
     if not lock_acquired:
-        response = await _wait_for_ready_segment(client, body.cache_key, body.wait)
-        if response is not None:
-            _fire_webhook_background(body.webhook_url, response, request_id=request_id)
+        cached = await client.hgetall(_segment_meta_key(body.cache_key))
+        if cached:
+            response = _segment_response_from_meta(body.cache_key, cached)
+            if response.status in ("ready", "failed", "early_failed"):
+                _fire_webhook_background(body.webhook_url, response, request_id=request_id)
             return response
         return _generating_response(body.cache_key, request_id)
 
@@ -812,54 +809,26 @@ async def create_tts_segment(
             _fire_webhook_background(body.webhook_url, response, request_id=request_id)
             return response
 
-        # Fire-and-forget mode: start background task, return 202 immediately
-        if not body.wait:
-            task = asyncio.create_task(
-                _synthesize_segment_background(
-                    body=body,
-                    client=client,
-                    lock_key=lock_key,
-                    lock_token=lock_token,
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    text=text,
-                    storage_key=storage_key,
-                    started_at=started_at,
-                )
+        # Always run in background (fire-and-forget)
+        task = asyncio.create_task(
+            _synthesize_segment_background(
+                body=body,
+                client=client,
+                lock_key=lock_key,
+                lock_token=lock_token,
+                request_id=request_id,
+                trace_id=trace_id,
+                text=text,
+                storage_key=storage_key,
+                started_at=started_at,
             )
-            _track_background_task(task)
-            lock_released_by_background = True
-            return _generating_response(body.cache_key, request_id)
-
-        # Synchronous mode: wait for synthesis to complete
-        response = await _synthesize_segment_to_meta(
-            body=body,
-            client=client,
-            request_id=request_id,
-            trace_id=trace_id,
-            text=text,
-            storage_key=storage_key,
-            started_at=started_at,
         )
-        _fire_webhook_background(body.webhook_url, response, request_id=request_id)
-        return response
+        _track_background_task(task)
+        lock_released_by_background = True
+        return _generating_response(body.cache_key, request_id)
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except EarlyFailedError as exc:
-        # Return early_failed so the orchestrator can hedge on another worker
-        early_response = TTSSegmentResponse(
-            status="early_failed",
-            cache_key=body.cache_key,
-            attempts=exc.attempts,
-            error=str(exc.last_error)[:500] if exc.last_error else "early_failed",
-        )
-        _fire_webhook_background(body.webhook_url, early_response, request_id=request_id)
-        return JSONResponse(
-            status_code=200,
-            content=early_response.model_dump(mode="json"),
-            headers={"Cache-Control": "no-store", "X-Request-ID": request_id},
-        )
     except Exception as exc:
         # Fire failed webhook
         failed_response = TTSSegmentResponse(

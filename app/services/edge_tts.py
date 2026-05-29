@@ -1,15 +1,11 @@
 import asyncio
-import html
 import math
 import os
 import random
-import re
 import sys
 import time
 from collections import deque
-from typing import Any
-
-from bs4 import BeautifulSoup
+from typing import Any, Callable
 
 from app.core.logger import get_logger
 
@@ -23,67 +19,22 @@ DEFAULT_TTS_RETRIES = int(os.getenv("EDGE_TTS_RETRIES", "10"))
 DEFAULT_HEDGE_AFTER_ATTEMPTS = int(os.getenv("EDGE_TTS_HEDGE_AFTER_ATTEMPTS", "4"))
 DEFAULT_CONNECT_TIMEOUT = int(os.getenv("EDGE_TTS_CONNECT_TIMEOUT", "8"))
 DEFAULT_RECEIVE_TIMEOUT = int(os.getenv("EDGE_TTS_RECEIVE_TIMEOUT", "30"))
-DEFAULT_SHORT_SEGMENT_CHARS = 180
-DEFAULT_LONG_SEGMENT_CHARS = 300
-DEFAULT_SHORT_SEGMENT_WORDS = 30
-DEFAULT_LONG_SEGMENT_WORDS = 50
-DEFAULT_SHORT_SEGMENT_COUNT = 5
 RETRY_SLEEP_MIN_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MIN_SECONDS", "0.1"))
 RETRY_SLEEP_MAX_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MAX_SECONDS", "0.2"))
 METRICS_SAMPLE_SIZE = int(os.getenv("EDGE_TTS_METRICS_SAMPLE_SIZE", "1000"))
-HARD_SPLIT_LOOKAHEAD_CHARS = 80
 
-SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+|(?<=[\u3002\uff01\uff1f])\s*")
 
 VOICE_ALIASES = {
     "hoaimy": "vi-VN-HoaiMyNeural",
     "female": "vi-VN-HoaiMyNeural",
     "namminh": "vi-VN-NamMinhNeural",
     "male": "vi-VN-NamMinhNeural",
-    "aria": "en-US-AriaNeural",
-    "english": "en-US-AriaNeural",
-    "en-female": "en-US-AriaNeural",
-    "guy": "en-US-GuyNeural",
-    "en-male": "en-US-GuyNeural",
-    "emma-ml": "en-US-EmmaMultilingualNeural",
-    "jenny-ml": "en-US-JennyMultilingualNeural",
-    "serena-ml": "en-US-SerenaMultilingualNeural",
-    "andrew-ml": "en-US-AndrewMultilingualNeural",
-    "brian-ml": "en-US-BrianMultilingualNeural",
-    "ryan-ml": "en-US-RyanMultilingualNeural",
-    "steffan-ml": "en-US-SteffanMultilingualNeural",
 }
 
 SUPPORTED_VOICES = {
     "vi-VN-HoaiMyNeural",
     "vi-VN-NamMinhNeural",
-    "en-US-AriaNeural",
-    "en-US-GuyNeural",
-    "en-US-EmmaMultilingualNeural",
-    "en-US-JennyMultilingualNeural",
-    "en-US-SerenaMultilingualNeural",
-    "en-US-AndrewMultilingualNeural",
-    "en-US-BrianMultilingualNeural",
-    "en-US-RyanMultilingualNeural",
-    "en-US-SteffanMultilingualNeural",
 }
-
-
-class EarlyFailedError(Exception):
-    """Raised when synthesis fails after hedge_after_attempts.
-
-    This signals the orchestrator to hedge the request on a different worker
-    instead of continuing to retry locally.
-    """
-
-    def __init__(self, attempts: int, last_error: Exception | None = None):
-        self.attempts = attempts
-        self.last_error = last_error
-        super().__init__(
-            f"Edge TTS early-failed after {attempts} attempt(s), "
-            f"signaling orchestrator to hedge: {last_error}"
-        )
-
 
 class EdgeTTSService:
     """Stateless Edge TTS engine.
@@ -99,20 +50,10 @@ class EdgeTTSService:
         concurrency: int = DEFAULT_TTS_CONCURRENCY,
         retries: int = DEFAULT_TTS_RETRIES,
         hedge_after_attempts: int = DEFAULT_HEDGE_AFTER_ATTEMPTS,
-        short_segment_chars: int = DEFAULT_SHORT_SEGMENT_CHARS,
-        long_segment_chars: int = DEFAULT_LONG_SEGMENT_CHARS,
-        short_segment_words: int = DEFAULT_SHORT_SEGMENT_WORDS,
-        long_segment_words: int = DEFAULT_LONG_SEGMENT_WORDS,
-        short_segment_count: int = DEFAULT_SHORT_SEGMENT_COUNT,
     ):
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
-        self.short_segment_chars = max(1, int(short_segment_chars))
-        self.long_segment_chars = max(1, int(long_segment_chars))
-        self.short_segment_words = max(0, int(short_segment_words))
-        self.long_segment_words = max(0, int(long_segment_words))
-        self.short_segment_count = max(0, int(short_segment_count))
 
         self.log = get_logger().bind(service="edge_tts_engine")
         self._queue: asyncio.PriorityQueue | None = None
@@ -129,54 +70,16 @@ class EdgeTTSService:
         self._completed_audio_seconds = 0.0
         self._synth_attempts = 0
         self._synth_failures = 0
-        self._lane_attempts: dict[str, int] = {}
-        self._lane_failures: dict[str, int] = {}
-        self._lane_successes: dict[str, int] = {}
         self._queue_wait_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._synth_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._duration_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._completion_events = deque(maxlen=METRICS_SAMPLE_SIZE)
-        self._stage_metrics: dict[str, dict] = {}
 
     def normalize_voice(self, voice: str) -> str:
         voice_id = VOICE_ALIASES.get((voice or "").lower(), voice)
         if voice_id not in SUPPORTED_VOICES:
             raise ValueError(f"Unsupported voice: {voice}")
         return voice_id
-
-    def split_html(self, content_html: str, segment_index_offset: int = 0) -> list[str]:
-        blocks = self._html_text_blocks(content_html)
-        return self._split_blocks_with_tiers(blocks, segment_index_offset=segment_index_offset)
-
-    def split_html_with_spans(self, content_html: str, segment_index_offset: int = 0) -> list[dict[str, Any]]:
-        plain_text = self.plain_text_from_html(content_html)
-        chunks = self.split_html(content_html, segment_index_offset=segment_index_offset)
-        cursor = 0
-        segments = []
-        for chunk in chunks:
-            start = plain_text.find(chunk, cursor)
-            if start < 0:
-                start = max(0, min(cursor, len(plain_text)))
-            end = min(len(plain_text), start + len(chunk))
-            segments.append({"text": chunk, "plain_start": start, "plain_end": end})
-            cursor = end
-        return segments
-
-    def plain_text_from_html(self, content_html: str) -> str:
-        return " ".join(self._html_text_blocks(content_html))
-
-    def _html_text_blocks(self, content_html: str) -> list[str]:
-        soup = BeautifulSoup(content_html or "", "html.parser")
-        blocks = []
-        for tag in soup.find_all(["p", "div", "li", "h1", "h2", "h3", "blockquote"]):
-            text_value = self._normalize_text(tag.get_text(" ", strip=True))
-            if text_value:
-                blocks.append(text_value)
-        if not blocks:
-            fallback = self._normalize_text(soup.get_text(" ", strip=True) if soup else content_html)
-            if fallback:
-                blocks.append(fallback)
-        return blocks
 
     async def synthesize_text_bytes(
         self,
@@ -189,6 +92,7 @@ class EdgeTTSService:
         priority_score: float,
         time_to_play_ms: float,
         trace_id: str | None = None,
+        on_early_failed: Callable[[int, Exception | None], Any] | None = None,
     ) -> tuple[bytes, float, str, str]:
         await self._ensure_workers()
         loop = asyncio.get_running_loop()
@@ -196,6 +100,7 @@ class EdgeTTSService:
         self._queue_sequence += 1
         queued_at = time.perf_counter()
         priority = float(priority_score)
+        self.log.debug("TTS job queued", priority=priority, sequence=self._queue_sequence)
         await self._queue.put(
             (
                 priority,
@@ -211,6 +116,7 @@ class EdgeTTSService:
                     "priority_score": priority,
                     "time_to_play_ms": time_to_play_ms,
                     "trace_id": trace_id,
+                    "on_early_failed": on_early_failed,
                 },
             )
         )
@@ -224,6 +130,7 @@ class EdgeTTSService:
         rate: str = "+0%",
         volume: str = "+0%",
         pitch: str = "+0Hz",
+        on_early_failed: Callable[[int, Exception | None], Any] | None = None,
     ) -> tuple[bytes, float, str, str]:
         voice_id = self.normalize_voice(voice)
         started_at = time.perf_counter()
@@ -235,6 +142,7 @@ class EdgeTTSService:
                 rate=rate,
                 volume=volume,
                 pitch=pitch,
+                on_early_failed=on_early_failed,
             )
             duration_started = time.perf_counter()
             duration = self._mp3_duration_seconds(audio)
@@ -281,16 +189,12 @@ class EdgeTTSService:
             "completed_audio_seconds": round(self._completed_audio_seconds, 3),
             "synth_attempts": self._synth_attempts,
             "synth_failures": self._synth_failures,
-            "lane_attempts": dict(self._lane_attempts),
-            "lane_failures": dict(self._lane_failures),
-            "lane_successes": dict(self._lane_successes),
             "latency_ms": {
                 "queue_wait": self._latency_summary(self._queue_wait_ms),
                 "synthesize": self._latency_summary(self._synth_ms),
                 "duration_scan": self._latency_summary(self._duration_ms),
             },
             "throughput": self._throughput_snapshot(),
-            "stages": self._stage_metrics_snapshot(),
             "health": {
                 "status": "healthy" if success_rate >= 0.8 else "degraded",
                 "success_rate": round(success_rate, 4),
@@ -324,6 +228,7 @@ class EdgeTTSService:
                     rate=job["rate"],
                     volume=job["volume"],
                     pitch=job["pitch"],
+                    on_early_failed=job.get("on_early_failed"),
                 )
                 if not future.done():
                     future.set_result(result)
@@ -333,32 +238,32 @@ class EdgeTTSService:
             finally:
                 self._queue.task_done()
 
-    async def _synthesize_with_retries(self, *, text: str, voice: str, rate: str, volume: str, pitch: str) -> bytes:
+    async def _synthesize_with_retries(
+        self, *, text: str, voice: str, rate: str, volume: str, pitch: str,
+        on_early_failed: Callable[[int, Exception | None], Any] | None = None,
+    ) -> bytes:
         """Retry synthesis up to self.retries times.
 
-        If hedge_after_attempts is configured (> 0 and < retries), raise
-        EarlyFailedError after that many consecutive failures so the
-        orchestrator can hedge the request on a different worker.
+        If hedge_after_attempts is configured (> 0 and < retries) and
+        on_early_failed is provided, call the callback once after that many
+        consecutive failures so the orchestrator can hedge the request on a
+        different worker.  The retry loop continues running after the callback.
         """
         last_error: Exception | None = None
-        lane = "main"
+        early_failed_fired = False
         for attempt in range(1, self.retries + 1):
             self._synth_attempts += 1
-            self._lane_attempts[lane] = self._lane_attempts.get(lane, 0) + 1
             try:
                 audio = await self._synthesize_once(text, voice, rate, volume, pitch)
                 if len(audio) < 512:
                     raise RuntimeError("Edge TTS returned an empty audio segment")
-                self._lane_successes[lane] = self._lane_successes.get(lane, 0) + 1
                 return audio
             except Exception as exc:
                 last_error = exc
                 self._synth_failures += 1
-                self._lane_failures[lane] = self._lane_failures.get(lane, 0) + 1
                 if attempt >= 7:
                     self.log.warning(
                         "edge_tts_synthesize_attempt_failed",
-                        lane=lane,
                         attempt=attempt,
                         max_attempts=self.retries,
                         voice=voice,
@@ -366,12 +271,18 @@ class EdgeTTSService:
                         text_preview=text[:120],
                         error=str(exc),
                     )
-                # Early-fail: signal orchestrator to hedge on another worker
+                # Early-fail: signal orchestrator to hedge on another worker (fire once)
                 if (
-                    0 < self.hedge_after_attempts < self.retries
+                    not early_failed_fired
+                    and on_early_failed is not None
+                    and 0 < self.hedge_after_attempts < self.retries
                     and attempt >= self.hedge_after_attempts
                 ):
-                    raise EarlyFailedError(attempt, last_error) from last_error
+                    early_failed_fired = True
+                    try:
+                        await on_early_failed(attempt, last_error)
+                    except Exception as cb_exc:
+                        self.log.debug("edge_tts_early_failed_callback_error", error=str(cb_exc))
 
                 if attempt < self.retries and RETRY_SLEEP_MAX_SECONDS > 0:
                     sleep_min = max(0.0, min(RETRY_SLEEP_MIN_SECONDS, RETRY_SLEEP_MAX_SECONDS))
@@ -407,106 +318,6 @@ class EdgeTTSService:
         self._synth_ms.append((time.perf_counter() - started_at) * 1000)
         return audio
 
-    async def _to_thread_stage(self, stage: str, func, *args, **kwargs):
-        def run():
-            started_at = time.perf_counter()
-            started_cpu = time.thread_time()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                self._record_stage_metric(stage, started_at, started_cpu)
-
-        return await asyncio.to_thread(run)
-
-    def _split_blocks_with_tiers(self, blocks: list[str], segment_index_offset: int = 0) -> list[str]:
-        segments: list[str] = []
-        pending = list(blocks)
-        offset = max(0, int(segment_index_offset or 0))
-        while pending:
-            absolute_index = offset + len(segments)
-            char_limit = self._segment_char_limit(absolute_index)
-            word_limit = self._segment_word_limit(absolute_index)
-            block = pending.pop(0)
-            parts = self._split_text_for_limit(block, char_limit, word_limit)
-            if not parts:
-                continue
-            segments.append(parts[0])
-            pending = parts[1:] + pending
-        return segments
-
-    def _split_text_for_limit(self, text_value: str, char_limit: int, word_limit: int = 0) -> list[str]:
-        text_value = self._normalize_text(text_value)
-        if not text_value:
-            return []
-        if len(text_value) <= char_limit and (word_limit <= 0 or len(text_value.split()) <= word_limit):
-            return [text_value]
-
-        sentences = self._split_sentences(text_value)
-        if len(sentences) <= 1:
-            return self._split_by_words(text_value, char_limit)
-
-        segments: list[str] = []
-        current: list[str] = []
-        current_words = 0
-        for sentence in sentences:
-            sentence_words = len(sentence.split())
-            candidate = " ".join(current + [sentence]).strip()
-            over_chars = len(candidate) > char_limit
-            over_words = word_limit > 0 and current_words + sentence_words > word_limit
-            if current and (over_chars or over_words):
-                segments.append(" ".join(current).strip())
-                current = [sentence]
-                current_words = sentence_words
-            else:
-                current.append(sentence)
-                current_words += sentence_words
-        if current:
-            segments.append(" ".join(current).strip())
-        flattened: list[str] = []
-        for segment in segments:
-            if len(segment) > char_limit * 2:
-                flattened.extend(self._split_by_words(segment, char_limit))
-            else:
-                flattened.append(segment)
-        return flattened
-
-    def _segment_char_limit(self, absolute_index: int) -> int:
-        return self.short_segment_chars if absolute_index < self.short_segment_count else self.long_segment_chars
-
-    def _segment_word_limit(self, absolute_index: int) -> int:
-        return self.short_segment_words if absolute_index < self.short_segment_count else self.long_segment_words
-
-    def _record_stage_metric(self, stage: str, started_at: float, started_cpu: float) -> None:
-        wall_ms = (time.perf_counter() - started_at) * 1000
-        cpu_ms = max(0.0, (time.thread_time() - started_cpu) * 1000)
-        bucket = self._stage_metrics.setdefault(
-            stage,
-            {
-                "wall_ms": deque(maxlen=METRICS_SAMPLE_SIZE),
-                "cpu_ms": deque(maxlen=METRICS_SAMPLE_SIZE),
-                "wall_ms_total": 0.0,
-                "cpu_ms_total": 0.0,
-                "count": 0,
-            },
-        )
-        bucket["wall_ms"].append(wall_ms)
-        bucket["cpu_ms"].append(cpu_ms)
-        bucket["wall_ms_total"] += wall_ms
-        bucket["cpu_ms_total"] += cpu_ms
-        bucket["count"] += 1
-
-    def _stage_metrics_snapshot(self) -> dict:
-        return {
-            stage: {
-                "count": data["count"],
-                "wall_ms": self._latency_summary(data["wall_ms"]),
-                "cpu_ms": self._latency_summary(data["cpu_ms"]),
-                "wall_seconds_total": round(data["wall_ms_total"] / 1000, 3),
-                "cpu_seconds_total": round(data["cpu_ms_total"] / 1000, 3),
-            }
-            for stage, data in sorted(self._stage_metrics.items())
-        }
-
     def _throughput_snapshot(self) -> dict:
         uptime = max(0.001, time.time() - self._service_started_at)
         recent_cutoff = time.time() - 60
@@ -528,42 +339,6 @@ class EdgeTTSService:
                 "audio_seconds_per_second": round(sum(event[4] for event in recent) / recent_span, 4),
             },
         }
-
-    @staticmethod
-    def _split_sentences(text_value: str) -> list[str]:
-        return [item.strip() for item in SENTENCE_END_RE.split(text_value) if item.strip()]
-
-    @staticmethod
-    def _normalize_text(value: str) -> str:
-        return re.sub(r"\s+", " ", html.unescape(value or "")).strip()
-
-    @staticmethod
-    def _split_by_words(text_value: str, limit: int) -> list[str]:
-        segments: list[str] = []
-        remaining = text_value.strip()
-        while len(remaining) > limit:
-            split_at = EdgeTTSService._find_word_split(remaining, limit)
-            if split_at >= len(remaining):
-                segments.append(remaining)
-                return segments
-            segments.append(remaining[:split_at].strip())
-            remaining = remaining[split_at:].strip()
-        if remaining:
-            segments.append(remaining)
-        return segments
-
-    @staticmethod
-    def _find_word_split(text_value: str, limit: int) -> int:
-        lookahead_limit = min(len(text_value), limit + HARD_SPLIT_LOOKAHEAD_CHARS)
-        for index in range(lookahead_limit - 1, max(0, limit // 2), -1):
-            if text_value[index] == " " and text_value[index - 1] in ".!?\u3002\uff01\uff1f":
-                return index
-        return len(text_value)
-
-    @staticmethod
-    def _estimate_duration(text_value: str) -> float:
-        words = max(1, len((text_value or "").split()))
-        return max(2.0, words / 165 * 60)
 
     @staticmethod
     def _latency_summary(values) -> dict:
