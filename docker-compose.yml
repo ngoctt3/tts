@@ -66,6 +66,12 @@ services:
       - truyendich-network
       - default
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+        reservations:
+          memory: 64M
 
   # ─────────────────────────────────────────────────────────
   # 2. Redis — internal cache & lock (independent)
@@ -73,7 +79,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: tts-redis
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     networks:
@@ -84,6 +90,12 @@ services:
       timeout: 3s
       retries: 5
     restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+        reservations:
+          memory: 16M
 
   # ─────────────────────────────────────────────────────────
   # 3. Nginx — public entrypoint (serve MP3 + proxy API)
@@ -107,6 +119,12 @@ services:
       - dokploy-network
       - truyendich-network
       - default
+    deploy:
+      resources:
+        limits:
+          memory: 50M
+        reservations:
+          memory: 8M
 
 volumes:
   media_cache:
