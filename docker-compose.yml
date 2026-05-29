@@ -21,7 +21,7 @@ services:
       EDGE_TTS_PUBLIC_BASE_URL: ${EDGE_TTS_PUBLIC_BASE_URL:-http://localhost:8080/media}
 
       # Internal Redis (inside compose network)
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://tts-redis:6379/0
 
       # Segment metadata
       EDGE_TTS_SEGMENT_META_TTL_SECONDS: ${EDGE_TTS_SEGMENT_META_TTL_SECONDS:-233280}
@@ -59,7 +59,7 @@ services:
       - media_cache:/data/edge_tts
       - app_logs:/var/log/edge-tts
     depends_on:
-      redis:
+      tts-redis:
         condition: service_healthy
     networks:
       - dokploy-network
@@ -76,7 +76,7 @@ services:
   # ─────────────────────────────────────────────────────────
   # 2. Redis — internal cache & lock (independent)
   # ─────────────────────────────────────────────────────────
-  redis:
+  tts-redis:
     image: redis:7-alpine
     container_name: tts-redis
     command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
@@ -114,7 +114,7 @@ services:
       - fastapi
     restart: always
     ports:
-      - "80:80"
+      - "8080:80"
     networks:
       - dokploy-network
       - truyendich-network
