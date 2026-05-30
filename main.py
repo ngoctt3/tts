@@ -282,15 +282,15 @@ async def _send_webhook(
                         "X-Cache-Key": cache_key,
                     },
                 )
-                if response.status_code < 400:
-                    log.debug(
-                        "edge_tts_webhook_sent",
-                        request_id=request_id,
-                        cache_key=cache_key,
-                        status_code=response.status_code,
-                        attempt=attempt,
-                    )
-                    return
+                # if response.status_code < 400:
+                #     log.info(
+                #         "edge_tts_webhook_sent",
+                #         request_id=request_id,
+                #         cache_key=cache_key,
+                #         status_code=response.status_code,
+                #         attempt=attempt,
+                #     )
+                #     return
                 log.warning(
                     "edge_tts_webhook_http_error",
                     request_id=request_id,
@@ -342,13 +342,13 @@ def _fire_webhook_background(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_cleanup_old_files())
-    log.info(
-        "remote_edge_tts_started",
-        public_base_url=PUBLIC_BASE_URL,
-        cleanup_interval_seconds=CLEANUP_INTERVAL_SECONDS,
-        cleanup_max_age_seconds=CLEANUP_MAX_AGE_SECONDS,
-        concurrency=edge_tts_service.concurrency,
-    )
+    # log.info(
+    #     "remote_edge_tts_started",
+    #     public_base_url=PUBLIC_BASE_URL,
+    #     cleanup_interval_seconds=CLEANUP_INTERVAL_SECONDS,
+    #     cleanup_max_age_seconds=CLEANUP_MAX_AGE_SECONDS,
+    #     concurrency=edge_tts_service.concurrency,
+    # )
     try:
         yield
     finally:
@@ -772,6 +772,7 @@ async def create_tts_segment(
     _: None = Depends(require_internal_token),
 ):
     request_id = _request_id_header(x_request_id or body.trace.request_id)
+    #log.info("received_tts_segment_request", request_id=request_id, cache_key=body.cache_key)
     trace = body.trace
     trace_id = _trace_id(request_id, trace.chain_id or None, trace.segment_index)
     text = _preclean_tts_text(body.text)
