@@ -11,6 +11,8 @@ and scale horizontally by deploying multiple nodes behind a load balancer.
 import asyncio
 import os
 import re
+import signal
+import sys
 import time
 import threading
 from contextlib import asynccontextmanager
@@ -155,6 +157,11 @@ media_storage = LocalDiskStorage(
 redis_pool: redis.Redis | None = None
 metrics_cache: dict = {"expires_at": 0.0, "payload": None}
 background_segment_tasks: set[asyncio.Task] = set()
+
+# Graceful shutdown state
+is_shutting_down = False
+health_5xx_responded = False
+shutdown_initiated = False
 
 # ──────────────────────────────────────────────────────────────────────
 # Pydantic models
@@ -336,11 +343,137 @@ def _fire_webhook_background(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Graceful Shutdown Signal Handling
+# ──────────────────────────────────────────────────────────────────────
+
+async def monitor_graceful_shutdown(sig: int, trigger_original_handler: Any) -> None:
+    global shutdown_initiated
+    if shutdown_initiated:
+        return
+    shutdown_initiated = True
+
+    log.info(
+        "graceful_shutdown_started",
+        active_tasks=len(background_segment_tasks),
+        health_5xx_responded=health_5xx_responded,
+        signal=sig,
+    )
+
+    start_time = time.perf_counter()
+    while True:
+        active_count = len(background_segment_tasks)
+        if health_5xx_responded and active_count == 0:
+            break
+
+        elapsed = time.perf_counter() - start_time
+        if int(elapsed) % 5 == 0:
+            log.info(
+                "waiting_for_graceful_shutdown",
+                elapsed_seconds=round(elapsed, 1),
+                active_tasks=active_count,
+                health_5xx_responded=health_5xx_responded,
+            )
+        await asyncio.sleep(0.5)
+
+    log.info(
+        "graceful_shutdown_conditions_met",
+        total_wait_seconds=round(time.perf_counter() - start_time, 2),
+    )
+    trigger_original_handler(sig)
+
+
+def setup_shutdown_handlers() -> None:
+    import signal
+    loop = asyncio.get_running_loop()
+    signals = [signal.SIGTERM, signal.SIGINT]
+
+    # Save existing loop-level handlers (Unix-specific)
+    loop_handlers = {}
+    for sig in signals:
+        try:
+            if hasattr(loop, "_signal_handlers") and sig in loop._signal_handlers:
+                loop_handlers[sig] = loop._signal_handlers[sig]
+        except Exception:
+            pass
+
+    # Save existing OS-level handlers
+    os_handlers = {}
+    for sig in signals:
+        try:
+            os_handlers[sig] = signal.getsignal(sig)
+        except ValueError:
+            pass
+
+    def trigger_original_handler(sig: int) -> None:
+        # Restore loop handler if it existed
+        if sig in loop_handlers:
+            try:
+                callback, args = loop_handlers[sig]
+                loop.add_signal_handler(sig, callback, *args)
+                loop.call_soon(callback, *args)
+                return
+            except Exception as exc:
+                log.warning("failed_to_restore_loop_handler", error=str(exc))
+
+        # Restore OS handler if it existed
+        if sig in os_handlers:
+            try:
+                signal.signal(sig, os_handlers[sig])
+                os.kill(os.getpid(), sig)
+                return
+            except Exception as exc:
+                log.warning("failed_to_restore_os_handler", error=str(exc))
+
+        # Fallback shutdown
+        log.warning("shutdown_fallback_exit")
+        sys.exit(0)
+
+    def loop_signal_callback(sig: int) -> None:
+        global is_shutting_down
+        if not is_shutting_down:
+            is_shutting_down = True
+            log.info("shutdown_loop_signal_received", signal=sig)
+            asyncio.create_task(monitor_graceful_shutdown(sig, trigger_original_handler))
+        else:
+            log.warning("force_shutdown_loop_signal_received")
+            trigger_original_handler(sig)
+
+    def os_signal_handler(sig: int, frame: Any) -> None:
+        global is_shutting_down
+        if not is_shutting_down:
+            is_shutting_down = True
+            log.info("shutdown_os_signal_received", signal=sig)
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(monitor_graceful_shutdown(sig, trigger_original_handler))
+            )
+        else:
+            log.warning("force_shutdown_os_signal_received")
+            trigger_original_handler(sig)
+
+    for sig in signals:
+        registered_loop = False
+        try:
+            if sig in loop_handlers:
+                loop.remove_signal_handler(sig)
+                loop.add_signal_handler(sig, loop_signal_callback, sig)
+                registered_loop = True
+        except (NotImplementedError, AttributeError, ValueError):
+            pass
+
+        if not registered_loop:
+            try:
+                signal.signal(sig, os_signal_handler)
+            except ValueError:
+                pass
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Lifespan
 # ──────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_shutdown_handlers()
     cleanup_task = asyncio.create_task(_cleanup_old_files())
     log.info(
         "remote_edge_tts_started",
@@ -695,6 +828,19 @@ async def _synthesize_segment_background(
 
 @app.get("/health")
 async def health():
+    if is_shutting_down:
+        global health_5xx_responded
+        health_5xx_responded = True
+        log.info("health_check_during_shutdown_served_5xx")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "shutting_down",
+                "service": "remote-edge-tts",
+                "message": "Service is shutting down gracefully"
+            }
+        )
+
     redis_ok = True
     redis_error = None
     try:
