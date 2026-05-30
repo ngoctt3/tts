@@ -36,6 +36,37 @@ SUPPORTED_VOICES = {
     "vi-VN-NamMinhNeural",
 }
 
+
+# MP3 Duration Scanner Constants
+MP3_BITRATES = {
+    3: {
+        3: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+        2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+        1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+    },
+    2: {
+        3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+        2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+        1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+    },
+    0: {
+        3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+        2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+        1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+    },
+}
+MP3_SAMPLE_RATES = {
+    3: [44100, 48000, 32000, 0],
+    2: [22050, 24000, 16000, 0],
+    0: [11025, 12000, 8000, 0],
+}
+MP3_SAMPLES_PER_FRAME = {
+    3: {3: 384, 2: 1152, 1: 1152},
+    2: {3: 384, 2: 1152, 1: 576},
+    0: {3: 384, 2: 1152, 1: 576},
+}
+
+
 class EdgeTTSService:
     """Stateless Edge TTS engine.
 
@@ -370,8 +401,9 @@ class EdgeTTSService:
         if not audio:
             return 0.0
 
+        audio_len = len(audio)
         index = 0
-        if len(audio) >= 10 and audio[:3] == b"ID3":
+        if audio_len >= 10 and audio[:3] == b"ID3":
             tag_size = (
                 ((audio[6] & 0x7F) << 21)
                 | ((audio[7] & 0x7F) << 14)
@@ -380,40 +412,18 @@ class EdgeTTSService:
             )
             index = 10 + tag_size
 
-        bitrates = {
-            3: {
-                3: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
-                2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
-                1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
-            },
-            2: {
-                3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
-                2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
-                1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
-            },
-            0: {
-                3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
-                2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
-                1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
-            },
-        }
-        sample_rates = {
-            3: [44100, 48000, 32000, 0],
-            2: [22050, 24000, 16000, 0],
-            0: [11025, 12000, 8000, 0],
-        }
-        samples_per_frame = {
-            3: {3: 384, 2: 1152, 1: 1152},
-            2: {3: 384, 2: 1152, 1: 576},
-            0: {3: 384, 2: 1152, 1: 576},
-        }
-
         total_seconds = 0.0
         frames = 0
-        while index + 4 <= len(audio):
-            if audio[index] != 0xFF or (audio[index + 1] & 0xE0) != 0xE0:
+        while index + 4 <= audio_len:
+            # Quickly scan to the next potential frame sync byte
+            index = audio.find(b"\xff", index)
+            if index == -1 or index + 4 > audio_len:
+                break
+
+            if (audio[index + 1] & 0xE0) != 0xE0:
                 index += 1
                 continue
+
             version_bits = (audio[index + 1] >> 3) & 0x03
             layer_bits = (audio[index + 1] >> 1) & 0x03
             bitrate_index = (audio[index + 2] >> 4) & 0x0F
@@ -422,12 +432,14 @@ class EdgeTTSService:
             if version_bits == 1 or layer_bits == 0:
                 index += 1
                 continue
-            bitrate = bitrates.get(version_bits, {}).get(layer_bits, [0] * 16)[bitrate_index] * 1000
-            sample_rate = sample_rates.get(version_bits, [0] * 4)[sample_rate_index]
-            samples = samples_per_frame.get(version_bits, {}).get(layer_bits, 0)
+
+            bitrate = MP3_BITRATES.get(version_bits, {}).get(layer_bits, [0] * 16)[bitrate_index] * 1000
+            sample_rate = MP3_SAMPLE_RATES.get(version_bits, [0] * 4)[sample_rate_index]
+            samples = MP3_SAMPLES_PER_FRAME.get(version_bits, {}).get(layer_bits, 0)
             if not bitrate or not sample_rate or not samples:
                 index += 1
                 continue
+
             if layer_bits == 3:
                 frame_size = int(((12 * bitrate / sample_rate) + padding) * 4)
             else:
@@ -436,6 +448,7 @@ class EdgeTTSService:
             if frame_size <= 0:
                 index += 1
                 continue
+
             total_seconds += samples / sample_rate
             frames += 1
             index += frame_size
