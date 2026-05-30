@@ -338,14 +338,19 @@ class EdgeTTSService:
             rate=rate,
             volume=volume,
             pitch=pitch,
-            connect_timeout=DEFAULT_CONNECT_TIMEOUT,
-            receive_timeout=DEFAULT_RECEIVE_TIMEOUT,
         )
-        chunks: list[bytes] = []
-        async for message in communicate.stream():
-            if message["type"] == "audio":
-                chunks.append(message["data"])
-        audio = b"".join(chunks)
+        async def _stream_with_timeout() -> bytes:
+            chunks: list[bytes] = []
+            async for message in communicate.stream():
+                if message["type"] == "audio":
+                    chunks.append(message["data"])
+            return b"".join(chunks)
+
+        try:
+            audio = await asyncio.wait_for(_stream_with_timeout(), timeout=DEFAULT_RECEIVE_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Edge TTS stream timed out after {DEFAULT_RECEIVE_TIMEOUT} seconds") from exc
+
         self._synth_ms.append((time.perf_counter() - started_at) * 1000)
         return audio
 
