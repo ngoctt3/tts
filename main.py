@@ -282,15 +282,15 @@ async def _send_webhook(
                         "X-Cache-Key": cache_key,
                     },
                 )
-                # if response.status_code < 400:
-                #     log.info(
-                #         "edge_tts_webhook_sent",
-                #         request_id=request_id,
-                #         cache_key=cache_key,
-                #         status_code=response.status_code,
-                #         attempt=attempt,
-                #     )
-                #     return
+                if response.status_code < 400:
+                    # log.info(
+                    #     "edge_tts_webhook_sent",
+                    #     request_id=request_id,
+                    #     cache_key=cache_key,
+                    #     status_code=response.status_code,
+                    #     attempt=attempt,
+                    # )
+                    return
                 log.warning(
                     "edge_tts_webhook_http_error",
                     request_id=request_id,
