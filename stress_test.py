@@ -13,8 +13,8 @@ os.environ["LOG_LEVEL"] = "ERROR"
 
 from app.services.edge_tts import EdgeTTSService
 
-CONCURRENCY_LEVELS = [4, 8, 16, 24, 32, 48, 64]
-REQUESTS_PER_RUN = 50  # Number of concurrent requests to queue up per run
+CONCURRENCY_LEVELS = [1]
+REQUESTS_PER_RUN = 1  # Number of concurrent requests to queue up per run
 
 # Realistic Vietnamese sentences to synthesize
 BASE_SENTENCES = [
@@ -26,8 +26,9 @@ BASE_SENTENCES = [
 ]
 
 async def run_single_request(service: EdgeTTSService, index: int) -> dict:
-    # Select a sentence and add a random salt to bypass Microsoft Edge TTS caching
-    base_text = BASE_SENTENCES[index % len(BASE_SENTENCES)]
+    # Combine 4 sentences to get around 50 words, and add a random salt to bypass caching
+    sentences = [BASE_SENTENCES[(index + i) % len(BASE_SENTENCES)] for i in range(4)]
+    base_text = " ".join(sentences)
     salt = uuid.uuid4().hex[:8]
     text = f"{base_text} Mã kiểm tra: {salt}."
     
@@ -114,12 +115,28 @@ async def benchmark_concurrency(concurrency: int) -> dict:
         
     throughput = success_count / total_time_seconds if total_time_seconds > 0 else 0.0
     
+    metrics = service.get_metrics()
+    proxies_info = metrics.get("proxies", {})
+    
     # Clean shutdown of workers
     await service.shutdown()
     
     print(f"Finished benchmark for concurrency = {concurrency}")
     print(f"  Success: {success_count}/{REQUESTS_PER_RUN} | Failures: {failure_count}")
     print(f"  Total Time: {total_time_seconds:.2f}s | Throughput: {throughput:.2f} req/s")
+    print(f"  Proxies: Active={proxies_info.get('active_count', 0)} | Dead={proxies_info.get('dead_count', 0)} | Total={proxies_info.get('total_loaded', 0)}")
+    
+    details = proxies_info.get("details", [])
+    if details:
+        print("  Individual Proxy Performance:")
+        print(f"    {'Proxy (IP:Port / NO_PROXY)':<45} | {'Status':<8} | {'Reqs':<6} | {'Success':<7} | {'Failed':<6} | {'Avg Latency':<12}")
+        print("    " + "-" * 95)
+        for p in details:
+            status_str = "DEAD" if p.get("is_dead") else "ACTIVE"
+            avg_lat = f"{p.get('avg_latency_ms', 0.0):.1f} ms" if p.get("avg_latency_ms", 0.0) > 0 else "-"
+            name = p.get("raw", "unknown")
+            print(f"    {name:<45} | {status_str:<8} | {p.get('total_requests', 0):<6} | {p.get('successful_requests', 0):<7} | {p.get('failed_requests', 0):<6} | {avg_lat:<12}")
+            
     if durations:
         print(f"  Latency (ms): Avg={avg_latency:.1f} | P50={p50_latency:.1f} | P95={p95_latency:.1f} | Max={max_latency:.1f}")
     if errors:
@@ -139,7 +156,8 @@ async def benchmark_concurrency(concurrency: int) -> dict:
         "p95_latency": p95_latency,
         "max_latency": max_latency,
         "min_latency": min_latency,
-        "errors": list(set(errors))
+        "errors": list(set(errors)),
+        "proxies": proxies_info
     }
 
 async def main():
@@ -162,14 +180,18 @@ async def main():
     print("\n" + "=" * 70)
     print("FINAL SUMMARY REPORT")
     print("=" * 70)
-    print(f"{'Concurrency':<12} | {'Success %':<10} | {'Total Time (s)':<14} | {'Throughput (req/s)':<18} | {'P50 Latency (ms)':<16} | {'P95 Latency (ms)':<16}")
-    print("-" * 90)
+    print(f"{'Concurrency':<12} | {'Success %':<10} | {'Total Time (s)':<14} | {'Throughput (req/s)':<18} | {'P50 Latency (ms)':<16} | {'P95 Latency (ms)':<16} | {'Proxies (A/D/T)':<16}")
+    print("-" * 110)
     
     best_concurrency = None
     best_throughput = 0.0
     
     for s in summaries:
-        print(f"{s['concurrency']:<12} | {s['success_rate']:<9.1f}% | {s['total_time']:<14.2f} | {s['throughput']:<18.2f} | {s['p50_latency']:<16.1f} | {s['p95_latency']:<16.1f}")
+        p_act = s["proxies"].get("active_count", 0)
+        p_dead = s["proxies"].get("dead_count", 0)
+        p_tot = s["proxies"].get("total_loaded", 0)
+        p_str = f"{p_act}/{p_dead}/{p_tot}"
+        print(f"{s['concurrency']:<12} | {s['success_rate']:<9.1f}% | {s['total_time']:<14.2f} | {s['throughput']:<18.2f} | {s['p50_latency']:<16.1f} | {s['p95_latency']:<16.1f} | {p_str:<16}")
         
         # We define the sweet spot as the highest throughput that achieves >= 98% success rate
         if s['success_rate'] >= 98.0 and s['throughput'] > best_throughput:

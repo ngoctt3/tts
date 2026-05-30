@@ -8,6 +8,7 @@ from collections import deque
 from typing import Any, Callable
 
 from app.core.logger import get_logger
+from app.services.proxy_manager import ProxyManager
 
 
 if sys.platform == "win32":
@@ -22,6 +23,11 @@ DEFAULT_RECEIVE_TIMEOUT = int(os.getenv("EDGE_TTS_RECEIVE_TIMEOUT", "15"))
 RETRY_SLEEP_MIN_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MIN_SECONDS", "0.1"))
 RETRY_SLEEP_MAX_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MAX_SECONDS", "0.2"))
 METRICS_SAMPLE_SIZE = int(os.getenv("EDGE_TTS_METRICS_SAMPLE_SIZE", "1000"))
+
+EDGE_TTS_PROXY_FILE = os.getenv("EDGE_TTS_PROXY_FILE", "proxy.txt")
+EDGE_TTS_PROXY_STRATEGY = os.getenv("EDGE_TTS_PROXY_STRATEGY", "roundrobin")
+EDGE_TTS_PROXY_CHECK_INTERVAL = float(os.getenv("EDGE_TTS_PROXY_CHECK_INTERVAL", "30.0"))
+EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.me/ip")
 
 
 VOICE_ALIASES = {
@@ -81,12 +87,22 @@ class EdgeTTSService:
         concurrency: int = DEFAULT_TTS_CONCURRENCY,
         retries: int = DEFAULT_TTS_RETRIES,
         hedge_after_attempts: int = DEFAULT_HEDGE_AFTER_ATTEMPTS,
+        proxy_file: str = EDGE_TTS_PROXY_FILE,
+        proxy_strategy: str = EDGE_TTS_PROXY_STRATEGY,
+        proxy_check_interval: float = EDGE_TTS_PROXY_CHECK_INTERVAL,
+        proxy_test_url: str = EDGE_TTS_PROXY_TEST_URL,
     ):
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
 
         self.log = get_logger().bind(service="edge_tts_engine")
+        self.proxy_manager = ProxyManager(
+            proxy_file_path=proxy_file,
+            strategy=proxy_strategy,
+            check_interval=proxy_check_interval,
+            test_url=proxy_test_url,
+        )
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_loop: asyncio.AbstractEventLoop | None = None
         self._worker_tasks: list[asyncio.Task] = []
@@ -201,6 +217,7 @@ class EdgeTTSService:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._queue = None
         self._worker_loop = None
+        await self.proxy_manager.stop_checker()
 
     def get_metrics(self, *, include_cache: bool = False) -> dict:
         total_jobs = self._completed_jobs + self._failed_jobs
@@ -220,6 +237,22 @@ class EdgeTTSService:
             "completed_audio_seconds": round(self._completed_audio_seconds, 3),
             "synth_attempts": self._synth_attempts,
             "synth_failures": self._synth_failures,
+            "proxies": {
+                "active_count": len(self.proxy_manager._active_pool) if hasattr(self, "proxy_manager") else 0,
+                "dead_count": len(self.proxy_manager._dead_proxies) if hasattr(self, "proxy_manager") else 0,
+                "total_loaded": len(self.proxy_manager.proxies) if hasattr(self, "proxy_manager") else 0,
+                "details": [
+                    {
+                        "raw": p.raw,
+                        "is_dead": p.is_dead,
+                        "total_requests": p.total_requests,
+                        "successful_requests": p.successful_requests,
+                        "failed_requests": p.failed_requests,
+                        "avg_latency_ms": round((sum(p.latencies) / len(p.latencies)) * 1000, 2) if p.latencies else 0.0,
+                    }
+                    for p in (self.proxy_manager.proxies + [self.proxy_manager._no_proxy])
+                ] if hasattr(self, "proxy_manager") else [],
+            },
             "latency_ms": {
                 "queue_wait": self._latency_summary(self._queue_wait_ms),
                 "synthesize": self._latency_summary(self._synth_ms),
@@ -238,6 +271,7 @@ class EdgeTTSService:
         alive = [task for task in self._worker_tasks if not task.done()]
         if self._queue is not None and self._worker_loop is loop and len(alive) == self.concurrency:
             self._worker_tasks = alive
+            self.proxy_manager.start_checker()
             return
         for task in alive:
             task.cancel()
@@ -246,6 +280,7 @@ class EdgeTTSService:
         self._queue = asyncio.PriorityQueue()
         self._worker_loop = loop
         self._worker_tasks = [asyncio.create_task(self._queue_worker(index), name=f"edge-tts-worker-{index}") for index in range(self.concurrency)]
+        self.proxy_manager.start_checker()
 
     async def _queue_worker(self, worker_index: int) -> None:
         while True:
@@ -280,18 +315,28 @@ class EdgeTTSService:
         consecutive failures so the orchestrator can hedge the request on a
         different worker.  The retry loop continues running after the callback.
         """
+        self.proxy_manager.start_checker()
         last_error: Exception | None = None
         early_failed_fired = False
         for attempt in range(1, self.retries + 1):
             self._synth_attempts += 1
+            proxy_item = await self.proxy_manager.get_proxy()
+            proxy_url = proxy_item.url if proxy_item else None
+            attempt_start = time.perf_counter()
             try:
-                audio = await self._synthesize_once(text, voice, rate, volume, pitch)
+                audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=proxy_url)
                 if len(audio) < 512:
                     raise RuntimeError("Edge TTS returned an empty audio segment")
+                attempt_latency = time.perf_counter() - attempt_start
+                if proxy_item:
+                    await self.proxy_manager.report_success(proxy_item, attempt_latency)
                 return audio
             except Exception as exc:
                 last_error = exc
                 self._synth_failures += 1
+                attempt_latency = time.perf_counter() - attempt_start
+                if proxy_item:
+                    await self.proxy_manager.report_failure(proxy_item, attempt_latency)
                 if attempt >= 7:
                     self.log.warning(
                         "edge_tts_synthesize_attempt_failed",
@@ -301,6 +346,7 @@ class EdgeTTSService:
                         text_length=len(text),
                         text_preview=text[:120],
                         error=str(exc),
+                        proxy=proxy_item.raw if proxy_item else None,
                     )
                 # Early-fail: signal orchestrator to hedge on another worker (fire once)
                 if (
@@ -328,6 +374,7 @@ class EdgeTTSService:
         rate: str,
         volume: str,
         pitch: str,
+        proxy: str | None = None,
     ) -> bytes:
         import edge_tts
 
@@ -338,6 +385,7 @@ class EdgeTTSService:
             rate=rate,
             volume=volume,
             pitch=pitch,
+            proxy=proxy,
         )
         async def _stream_with_timeout() -> bytes:
             chunks: list[bytes] = []
