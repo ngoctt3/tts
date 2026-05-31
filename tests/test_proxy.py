@@ -10,7 +10,7 @@ import httpx
 # Ensure root directory is in python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.proxy_manager import ProxyItem, NoProxyItem, ProxyManager
+from app.services.proxy_manager import ProxyItem, ProxyManager
 from app.services.edge_tts import EdgeTTSService
 
 
@@ -51,9 +51,8 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pm.proxies[1].url, "http://198.105.121.200:6462")
         self.assertEqual(pm.proxies[2].url, "http://64.137.96.74:6641")
 
-        # 3 loaded proxies + 1 NoProxyItem = 4 active items initially
-        self.assertEqual(len(pm._active_pool), 4)
-        self.assertTrue(isinstance(pm._active_pool[-1], NoProxyItem))
+        # Active pool contains real proxies only.
+        self.assertEqual(len(pm._active_pool), 3)
 
     async def test_rotation_strategies(self):
         # Round Robin
@@ -68,24 +67,23 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].raw, "38.154.203.95:5863:barmzddg:3so7je86elbd")
         self.assertEqual(items[1].raw, "198.105.121.200:6462")
         self.assertEqual(items[2].url, "http://64.137.96.74:6641")
-        self.assertTrue(isinstance(items[3], NoProxyItem))
+        self.assertEqual(items[3].raw, "38.154.203.95:5863:barmzddg:3so7je86elbd")
 
         # Check next loop
         next_item = await pm_rr.get_proxy()
-        self.assertEqual(next_item.raw, "38.154.203.95:5863:barmzddg:3so7je86elbd")
+        self.assertEqual(next_item.raw, "198.105.121.200:6462")
 
         # Shuffle
         pm_sh = ProxyManager(proxy_file_path=self.proxy_file_path, strategy="shuffle")
         chosen = [await pm_sh.get_proxy() for _ in range(20)]
-        # Ensure we got different choices and NoProxyItem is also part of it
-        self.assertTrue(any(isinstance(x, NoProxyItem) for x in chosen))
+        # Ensure we got real proxy choices only.
         self.assertTrue(any(x.raw == "198.105.121.200:6462" for x in chosen))
 
     async def test_failure_threshold_and_revival(self):
         pm = ProxyManager(proxy_file_path=self.proxy_file_path, check_interval=0.05)
         
-        # Initially, active pool contains 3 loaded + 1 NoProxy
-        self.assertEqual(len(pm._active_pool), 4)
+        # Initially, active pool contains the 3 loaded proxies only.
+        self.assertEqual(len(pm._active_pool), 3)
         self.assertEqual(len(pm._dead_proxies), 0)
 
         p1 = pm.proxies[0]
@@ -93,7 +91,7 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         # First failure
         await pm.report_failure(p1)
         self.assertEqual(p1.fail_count, 1)
-        self.assertEqual(len(pm._active_pool), 4)
+        self.assertEqual(len(pm._active_pool), 3)
 
         # Success resets count
         await pm.report_success(p1)
@@ -106,17 +104,8 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(p1.fail_count, 3)
         self.assertTrue(p1.is_dead)
-        self.assertEqual(len(pm._active_pool), 3)  # Removed from active pool
+        self.assertEqual(len(pm._active_pool), 2)  # Removed from active pool
         self.assertIn(p1, pm._dead_proxies)
-
-        # Verify NO_PROXY is never marked dead or removed
-        no_proxy = pm._no_proxy
-        await pm.report_failure(no_proxy)
-        await pm.report_failure(no_proxy)
-        await pm.report_failure(no_proxy)
-        self.assertFalse(no_proxy.is_dead)
-        self.assertEqual(no_proxy.fail_count, 0)
-        self.assertIn(no_proxy, pm._active_pool)
 
         # Start checker and test revival using mocked HTTP response
         mock_response = AsyncMock()
@@ -133,10 +122,10 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         # P1 should be revived
         self.assertFalse(p1.is_dead)
         self.assertEqual(p1.fail_count, 0)
-        self.assertEqual(len(pm._active_pool), 4)
+        self.assertEqual(len(pm._active_pool), 3)
         self.assertEqual(len(pm._dead_proxies), 0)
 
-    async def test_no_proxy_fallback_when_all_dead(self):
+    async def test_raises_when_all_proxies_dead(self):
         pm = ProxyManager(proxy_file_path=self.proxy_file_path)
         
         # Mark all loaded proxies as dead
@@ -145,14 +134,10 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             await pm.report_failure(p)
             await pm.report_failure(p)
             
-        self.assertEqual(len(pm._active_pool), 1)
-        self.assertTrue(isinstance(pm._active_pool[0], NoProxyItem))
+        self.assertEqual(len(pm._active_pool), 0)
         
-        # Even after multiple calls, it should return NoProxyItem (url=None)
-        for _ in range(5):
-            item = await pm.get_proxy()
-            self.assertTrue(isinstance(item, NoProxyItem))
-            self.assertIsNone(item.url)
+        with self.assertRaisesRegex(RuntimeError, "No active proxies available"):
+            await pm.get_proxy()
 
     async def test_edge_tts_integration(self):
         service = EdgeTTSService(
@@ -170,10 +155,8 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             nonlocal call_count
             call_count += 1
             used_proxies.append(proxy)
-            if proxy is not None:
-                # Fail all proxy connections to trigger retries and proxy failures
+            if call_count < 4:
                 raise RuntimeError("Proxy connection failed")
-            # Return dummy audio on direct connection (proxy=None)
             return b"dummyaudio" * 100  # length >= 512
 
         with patch.object(service, "_synthesize_once", side_effect=mock_synth_once):
@@ -186,16 +169,11 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(audio, b"dummyaudio" * 100)
             self.assertEqual(call_count, 4)
-            # Three proxy URLs (strings) and one None (NO_PROXY)
-            self.assertIsNone(used_proxies[-1])
-            self.assertIsNotNone(used_proxies[0])
-            self.assertIsNotNone(used_proxies[1])
-            self.assertIsNotNone(used_proxies[2])
+            self.assertTrue(all(proxy is not None for proxy in used_proxies))
             
-        # Ensure fail counts were recorded
-        # Each used proxy should have fail_count >= 1 (consecutive)
-        for proxy in service.proxy_manager.proxies:
-            self.assertGreater(proxy.fail_count, 0)
+        # Ensure all attempts were recorded against real proxies.
+        self.assertEqual(sum(proxy.total_requests for proxy in service.proxy_manager.proxies), 4)
+        self.assertEqual(sum(proxy.failed_requests for proxy in service.proxy_manager.proxies), 3)
             
         await service.shutdown()
 
@@ -206,7 +184,6 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             hedge_after_attempts=3,
             proxy_file=self.proxy_file_path,
             proxy_check_interval=0.1,
-            proxy_hedging=True,
             proxy_hedging_depth=2,
         )
         
@@ -236,20 +213,15 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             
             # Total attempts should be hedge_after_attempts (3) + proxy_hedging_depth (2) = 5
             self.assertEqual(len(used_proxies), 5)
-            # The first 3 should be None (NO_PROXY)
-            self.assertIsNone(used_proxies[0])
-            self.assertIsNone(used_proxies[1])
-            self.assertIsNone(used_proxies[2])
-            # The next 2 should be real proxy URLs (not None)
-            self.assertIsNotNone(used_proxies[3])
-            self.assertIsNotNone(used_proxies[4])
+            # All attempts should use real proxy URLs.
+            self.assertTrue(all(proxy is not None for proxy in used_proxies))
             # The callback should NOT have been fired
             self.assertFalse(early_failed_called)
             
             # Verify metrics
-            self.assertEqual(service.proxy_hedging_attempts, 2)
+            self.assertEqual(service.proxy_hedging_attempts, 5)
             self.assertEqual(service.proxy_hedging_successes, 0)
-            self.assertEqual(service.proxy_hedging_failures, 2)
+            self.assertEqual(service.proxy_hedging_failures, 5)
             
         await service.shutdown()
 

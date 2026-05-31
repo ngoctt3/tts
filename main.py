@@ -899,7 +899,7 @@ async def health():
                 "total": total_proxies,
                 "healthy": healthy_proxies,
                 "dead": dead_proxies,
-                "hedging_proxy": edge_tts_service.proxy_hedging,
+                "hedging_proxy": True,
                 "hedging_proxy_depth": edge_tts_service.proxy_hedging_depth,
             }
         },
@@ -916,7 +916,7 @@ async def tts_status(_: None = Depends(require_internal_token)):
         "service": "remote-edge-tts",
         "uptime_seconds": health.get("uptime_seconds"),
         "public_base_url": PUBLIC_BASE_URL,
-        "hedging_proxy": edge_tts_service.proxy_hedging,
+        "hedging_proxy": True,
         "hedging_proxy_depth": edge_tts_service.proxy_hedging_depth,
         "cleanup": {
             "max_age_seconds": CLEANUP_MAX_AGE_SECONDS,
@@ -930,14 +930,14 @@ async def tts_status(_: None = Depends(require_internal_token)):
                 "success_rate": health.get("success_rate"),
                 "synth_failures": metrics.get("synth_failures", 0),
                 "failed_jobs": metrics.get("failed_jobs", 0),
-                "hedging_proxy": edge_tts_service.proxy_hedging,
+                "hedging_proxy": True,
                 "hedging_proxy_depth": edge_tts_service.proxy_hedging_depth,
             },
             "proxies": {
                 "total": len(edge_tts_service.proxy_manager.proxies) if hasattr(edge_tts_service, "proxy_manager") else 0,
                 "healthy": (len(edge_tts_service.proxy_manager.proxies) - len(edge_tts_service.proxy_manager._dead_proxies)) if hasattr(edge_tts_service, "proxy_manager") else 0,
                 "dead": len(edge_tts_service.proxy_manager._dead_proxies) if hasattr(edge_tts_service, "proxy_manager") else 0,
-                "hedging_proxy": edge_tts_service.proxy_hedging,
+                "hedging_proxy": True,
                 "hedging_proxy_depth": edge_tts_service.proxy_hedging_depth,
             }
         },

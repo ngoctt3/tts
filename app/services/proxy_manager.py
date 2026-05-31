@@ -2,7 +2,7 @@ import asyncio
 import os
 import random
 from collections import deque
-from typing import List, Set, Union
+from typing import List, Set
 import httpx
 
 from app.core.logger import get_logger
@@ -34,21 +34,6 @@ class ProxyItem:
         return f"ProxyItem(raw={self.raw}, url={self.url}, fail_count={self.fail_count}, is_dead={self.is_dead})"
 
 
-class NoProxyItem:
-    def __init__(self):
-        self.raw = "NO_PROXY"
-        self.url = None
-        self.fail_count = 0
-        self.is_dead = False
-        self.total_requests = 0
-        self.successful_requests = 0
-        self.failed_requests = 0
-        self.latencies = deque(maxlen=1000)
-
-    def __repr__(self) -> str:
-        return "NoProxyItem()"
-
-
 class ProxyManager:
     def __init__(
         self,
@@ -64,13 +49,12 @@ class ProxyManager:
         self.log = get_logger().bind(service="proxy_manager")
         
         self._lock = asyncio.Lock()
-        self._no_proxy = NoProxyItem()
         
         # Load proxies
         self.proxies = self.load_proxies()
         
-        # Active pool: initially all loaded proxies + NoProxyItem
-        self._active_pool: List[Union[ProxyItem, NoProxyItem]] = list(self.proxies) + [self._no_proxy]
+        # Active pool contains real proxies only. Direct/no-proxy synthesis is not allowed.
+        self._active_pool: List[ProxyItem] = list(self.proxies)
         self._dead_proxies: Set[ProxyItem] = set()
         
         self._checker_task: asyncio.Task | None = None
@@ -112,23 +96,10 @@ class ProxyManager:
             self._checker_task = None
             self.log.info("Stopped proxy checker background task")
 
-    async def get_proxy(self, force_real: bool = False) -> Union[ProxyItem, NoProxyItem]:
+    async def get_proxy(self) -> ProxyItem:
         async with self._lock:
             if not self._active_pool:
-                # If active pool is empty for some reason, return NO_PROXY fallback
-                return self._no_proxy
-
-            if force_real:
-                real_proxies = [p for p in self._active_pool if not isinstance(p, NoProxyItem)]
-                if real_proxies:
-                    if self.strategy == "shuffle":
-                        return random.choice(real_proxies)
-                    else:  # roundrobin
-                        for idx, item in enumerate(self._active_pool):
-                            if not isinstance(item, NoProxyItem):
-                                self._active_pool.pop(idx)
-                                self._active_pool.append(item)
-                                return item
+                raise RuntimeError("No active proxies available")
 
             if self.strategy == "shuffle":
                 return random.choice(self._active_pool)
@@ -137,30 +108,24 @@ class ProxyManager:
                 self._active_pool.append(item)
                 return item
 
-    async def report_success(self, proxy: Union[ProxyItem, NoProxyItem], latency: float = 0.0):
+    async def report_success(self, proxy: ProxyItem, latency: float = 0.0):
         async with self._lock:
             proxy.total_requests += 1
             proxy.successful_requests += 1
             if latency > 0.0:
                 proxy.latencies.append(latency)
             
-            if isinstance(proxy, NoProxyItem):
-                return
-            
             if proxy.fail_count > 0:
                 self.log.debug("Resetting proxy fail count on success", proxy=proxy.raw)
                 proxy.fail_count = 0
 
-    async def report_failure(self, proxy: Union[ProxyItem, NoProxyItem], latency: float = 0.0):
+    async def report_failure(self, proxy: ProxyItem, latency: float = 0.0):
         async with self._lock:
             proxy.total_requests += 1
             proxy.failed_requests += 1
             if latency > 0.0:
                 proxy.latencies.append(latency)
             
-            if isinstance(proxy, NoProxyItem):
-                return
-
             proxy.fail_count += 1
             self.log.warning("Proxy failed", proxy=proxy.raw, fail_count=proxy.fail_count)
             if proxy.fail_count >= 3:
@@ -207,10 +172,7 @@ class ProxyManager:
                                 self._dead_proxies.remove(proxy)
                                 proxy.fail_count = 0
                                 proxy.is_dead = False
-                                # Put back to active pool if not there
                                 if proxy not in self._active_pool:
-                                    # Insert before NO_PROXY (which is usually at the end) or just append
-                                    # We can insert at index 0 or just append. Let's append.
                                     self._active_pool.append(proxy)
                                 self.log.success("Proxy revived and returned to pool", proxy=proxy.raw)
             except asyncio.CancelledError:

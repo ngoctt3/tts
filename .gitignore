@@ -1,3 +1,4 @@
 *.cpython-311.pyc
 /logs/log.txt
 /.agent
+*.pyc

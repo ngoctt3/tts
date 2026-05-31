@@ -9,7 +9,7 @@ import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.edge_tts import EdgeTTSService
-from app.services.proxy_manager import ProxyItem, NoProxyItem
+from app.services.proxy_manager import ProxyItem
 
 async def run_stress_test():
     print("=== Starting Proxy Stress Test ===")
@@ -51,7 +51,6 @@ async def run_stress_test():
     # Mock _synthesize_once to simulate real proxy behaviors:
     # - Some proxies are extremely flaky (always fail)
     # - Some are moderately flaky (fail 50% of the time)
-    # - Direct connection (proxy=None) always succeeds
     # - Normal proxies fail 20% of the time
     async def mock_synthesize_once(text, voice, rate, volume, pitch, proxy=None):
         stats["calls"] += 1
@@ -61,11 +60,6 @@ async def run_stress_test():
         # Simulate network latency
         await asyncio.sleep(random.uniform(0.01, 0.05))
         
-        if proxy is None:
-            stats["success"] += 1
-            stats["by_proxy"][proxy]["success"] += 1
-            return b"a" * 1024
-            
         # Determine failure rate based on proxy IP
         # Let's say odd IPs fail 80% of the time, even IPs fail 20% of the time
         fail_threshold = 0.20

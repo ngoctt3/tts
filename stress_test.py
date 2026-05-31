@@ -129,7 +129,7 @@ async def benchmark_concurrency(concurrency: int) -> dict:
     details = proxies_info.get("details", [])
     if details:
         print("  Individual Proxy Performance:")
-        print(f"    {'Proxy (IP:Port / NO_PROXY)':<45} | {'Status':<8} | {'Reqs':<6} | {'Success':<7} | {'Failed':<6} | {'Avg Latency':<12}")
+        print(f"    {'Proxy (IP:Port)':<45} | {'Status':<8} | {'Reqs':<6} | {'Success':<7} | {'Failed':<6} | {'Avg Latency':<12}")
         print("    " + "-" * 95)
         for p in details:
             status_str = "DEAD" if p.get("is_dead") else "ACTIVE"
