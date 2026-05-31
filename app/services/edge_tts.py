@@ -251,6 +251,8 @@ class EdgeTTSService:
                 "active_count": len(self.proxy_manager._active_pool) if hasattr(self, "proxy_manager") else 0,
                 "dead_count": len(self.proxy_manager._dead_proxies) if hasattr(self, "proxy_manager") else 0,
                 "total_loaded": len(self.proxy_manager.proxies) if hasattr(self, "proxy_manager") else 0,
+                "hedging_proxy": self.proxy_hedging,
+                "hedging_proxy_depth": self.proxy_hedging_depth,
                 "hedging_attempts": self.proxy_hedging_attempts,
                 "hedging_successes": self.proxy_hedging_successes,
                 "hedging_failures": self.proxy_hedging_failures,
