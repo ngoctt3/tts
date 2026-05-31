@@ -4,9 +4,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     ENV=production \
-    LOG_FILE=/var/log/edge-tts/service.log
+    LOG_FILE=/var/log/edge-tts/service.log \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN addgroup --system app && adduser --system --ingroup app app
 

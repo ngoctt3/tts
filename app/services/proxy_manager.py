@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+from collections import deque
 from typing import List, Set, Union
 import httpx
 
@@ -27,7 +28,7 @@ class ProxyItem:
         self.total_requests = 0
         self.successful_requests = 0
         self.failed_requests = 0
-        self.latencies: List[float] = []
+        self.latencies = deque(maxlen=1000)
 
     def __repr__(self) -> str:
         return f"ProxyItem(raw={self.raw}, url={self.url}, fail_count={self.fail_count}, is_dead={self.is_dead})"
@@ -42,7 +43,7 @@ class NoProxyItem:
         self.total_requests = 0
         self.successful_requests = 0
         self.failed_requests = 0
-        self.latencies: List[float] = []
+        self.latencies = deque(maxlen=1000)
 
     def __repr__(self) -> str:
         return "NoProxyItem()"

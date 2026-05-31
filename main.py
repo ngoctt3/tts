@@ -155,6 +155,7 @@ media_storage = LocalDiskStorage(
 # ──────────────────────────────────────────────────────────────────────
 
 redis_pool: redis.Redis | None = None
+webhook_client: httpx.AsyncClient | None = None
 metrics_cache: dict = {"expires_at": 0.0, "payload": None}
 background_segment_tasks: set[asyncio.Task] = set()
 
@@ -265,6 +266,21 @@ async def _cleanup_old_files() -> None:
             log.warning("edge_tts_cleanup_error", error=str(exc))
 
 
+async def _periodic_gc_collector() -> None:
+    """Periodically run Python garbage collection to free reference cycles and fragmentation."""
+    import gc
+    log.info("Starting periodic garbage collection task")
+    while True:
+        try:
+            await asyncio.sleep(600)  # Every 10 minutes
+            collected = await asyncio.to_thread(gc.collect)
+            log.debug("periodic_gc_completed", collected_objects=collected)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("periodic_gc_error", error=str(exc))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Webhook sender
 # ──────────────────────────────────────────────────────────────────────
@@ -277,34 +293,37 @@ async def _send_webhook(
     cache_key: str,
 ) -> None:
     """POST the payload to the webhook URL with exponential backoff retry."""
+    global webhook_client
+    if webhook_client is None:
+        limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
+        webhook_client = httpx.AsyncClient(limits=limits, timeout=WEBHOOK_TIMEOUT)
     for attempt in range(1, WEBHOOK_MAX_RETRIES + 1):
         try:
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-                response = await client.post(
-                    webhook_url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Request-ID": request_id,
-                        "X-Cache-Key": cache_key,
-                    },
-                )
-                if response.status_code < 400:
-                    log.debug(
-                        "edge_tts_webhook_sent",
-                        request_id=request_id,
-                        cache_key=cache_key,
-                        status_code=response.status_code,
-                        attempt=attempt,
-                    )
-                    return
-                log.warning(
-                    "edge_tts_webhook_http_error",
+            response = await webhook_client.post(
+                webhook_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Request-ID": request_id,
+                    "X-Cache-Key": cache_key,
+                },
+            )
+            if response.status_code < 400:
+                log.debug(
+                    "edge_tts_webhook_sent",
                     request_id=request_id,
                     cache_key=cache_key,
                     status_code=response.status_code,
                     attempt=attempt,
                 )
+                return
+            log.warning(
+                "edge_tts_webhook_http_error",
+                request_id=request_id,
+                cache_key=cache_key,
+                status_code=response.status_code,
+                attempt=attempt,
+            )
         except Exception as exc:
             log.warning(
                 "edge_tts_webhook_failed",
@@ -473,8 +492,12 @@ def setup_shutdown_handlers() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global webhook_client
     setup_shutdown_handlers()
     cleanup_task = asyncio.create_task(_cleanup_old_files())
+    gc_task = asyncio.create_task(_periodic_gc_collector())
+    limits = httpx.Limits(max_keepalive_connections=50, max_connections=200)
+    webhook_client = httpx.AsyncClient(limits=limits, timeout=WEBHOOK_TIMEOUT)
     log.info(
         "remote_edge_tts_started",
         public_base_url=PUBLIC_BASE_URL,
@@ -486,12 +509,15 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         cleanup_task.cancel()
+        gc_task.cancel()
         tasks = list(background_segment_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await edge_tts_service.shutdown()
+        if webhook_client is not None:
+            await webhook_client.aclose()
         if redis_pool is not None:
             await redis_pool.aclose()
 

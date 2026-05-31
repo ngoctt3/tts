@@ -13,6 +13,7 @@ services:
       ENV: production
       LOG_LEVEL: INFO
       PYTHONPATH: /app
+      MALLOC_ARENA_MAX: "2"
 
       # Auth
       EDGE_TTS_INTERNAL_TOKEN: ${EDGE_TTS_INTERNAL_TOKEN:-dev-edge-tts-token}
