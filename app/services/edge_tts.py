@@ -29,6 +29,9 @@ EDGE_TTS_PROXY_STRATEGY = os.getenv("EDGE_TTS_PROXY_STRATEGY", "roundrobin")
 EDGE_TTS_PROXY_CHECK_INTERVAL = float(os.getenv("EDGE_TTS_PROXY_CHECK_INTERVAL", "30.0"))
 EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.me/ip")
 
+DEFAULT_PROXY_HEDGING = os.getenv("EDGE_TTS_PROXY_HEDGING", "true").lower() in ("true", "1", "yes")
+DEFAULT_PROXY_HEDGING_DEPTH = int(os.getenv("EDGE_TTS_PROXY_HEDGING_DEPTH", "2"))
+
 
 VOICE_ALIASES = {
     "hoaimy": "vi-VN-HoaiMyNeural",
@@ -91,10 +94,14 @@ class EdgeTTSService:
         proxy_strategy: str = EDGE_TTS_PROXY_STRATEGY,
         proxy_check_interval: float = EDGE_TTS_PROXY_CHECK_INTERVAL,
         proxy_test_url: str = EDGE_TTS_PROXY_TEST_URL,
+        proxy_hedging: bool = DEFAULT_PROXY_HEDGING,
+        proxy_hedging_depth: int = DEFAULT_PROXY_HEDGING_DEPTH,
     ):
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
+        self.proxy_hedging = bool(proxy_hedging)
+        self.proxy_hedging_depth = max(0, int(proxy_hedging_depth))
 
         self.log = get_logger().bind(service="edge_tts_engine")
         self.proxy_manager = ProxyManager(
@@ -117,6 +124,9 @@ class EdgeTTSService:
         self._completed_audio_seconds = 0.0
         self._synth_attempts = 0
         self._synth_failures = 0
+        self.proxy_hedging_attempts = 0
+        self.proxy_hedging_successes = 0
+        self.proxy_hedging_failures = 0
         self._queue_wait_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._synth_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._duration_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
@@ -241,6 +251,9 @@ class EdgeTTSService:
                 "active_count": len(self.proxy_manager._active_pool) if hasattr(self, "proxy_manager") else 0,
                 "dead_count": len(self.proxy_manager._dead_proxies) if hasattr(self, "proxy_manager") else 0,
                 "total_loaded": len(self.proxy_manager.proxies) if hasattr(self, "proxy_manager") else 0,
+                "hedging_attempts": self.proxy_hedging_attempts,
+                "hedging_successes": self.proxy_hedging_successes,
+                "hedging_failures": self.proxy_hedging_failures,
                 "details": [
                     {
                         "raw": p.raw,
@@ -316,7 +329,63 @@ class EdgeTTSService:
         different worker.  The retry loop continues running after the callback.
         """
         self.proxy_manager.start_checker()
-        last_error: Exception | None = None
+        
+        if self.proxy_hedging and self.hedge_after_attempts > 0:
+            total_attempts = self.hedge_after_attempts + self.proxy_hedging_depth
+            last_error: Exception | None = None
+            early_failed_fired = False
+            
+            for attempt in range(1, total_attempts + 1):
+                self._synth_attempts += 1
+                
+                # Determine proxy to use
+                if attempt <= self.hedge_after_attempts:
+                    proxy_item = self.proxy_manager._no_proxy
+                else:
+                    proxy_item = await self.proxy_manager.get_proxy(force_real=True)
+                    self.proxy_hedging_attempts += 1
+                
+                proxy_url = proxy_item.url if proxy_item else None
+                attempt_start = time.perf_counter()
+                
+                try:
+                    audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=proxy_url)
+                    if len(audio) < 512:
+                        raise RuntimeError("Edge TTS returned an empty audio segment")
+                    attempt_latency = time.perf_counter() - attempt_start
+                    if proxy_item:
+                        await self.proxy_manager.report_success(proxy_item, attempt_latency)
+                    if attempt > self.hedge_after_attempts:
+                        self.proxy_hedging_successes += 1
+                    return audio
+                except Exception as exc:
+                    last_error = exc
+                    self._synth_failures += 1
+                    attempt_latency = time.perf_counter() - attempt_start
+                    if proxy_item:
+                        await self.proxy_manager.report_failure(proxy_item, attempt_latency)
+                    if attempt > self.hedge_after_attempts:
+                        self.proxy_hedging_failures += 1
+                    
+                    if attempt >= 7:
+                        self.log.warning(
+                            "edge_tts_synthesize_attempt_failed",
+                            attempt=attempt,
+                            max_attempts=total_attempts,
+                            voice=voice,
+                            text_length=len(text),
+                            text_preview=text[:120],
+                            error=str(exc),
+                            proxy=proxy_item.raw if proxy_item else None,
+                        )
+                    if attempt < total_attempts and RETRY_SLEEP_MAX_SECONDS > 0:
+                        sleep_min = max(0.0, min(RETRY_SLEEP_MIN_SECONDS, RETRY_SLEEP_MAX_SECONDS))
+                        sleep_max = max(sleep_min, RETRY_SLEEP_MAX_SECONDS)
+                        await asyncio.sleep(random.uniform(sleep_min, sleep_max))
+            raise RuntimeError(f"Edge TTS failed after {total_attempts} attempt(s) (including proxy hedging): {last_error}")
+
+        # Fallback to standard retry logic (backward-compatible)
+        last_error = None
         early_failed_fired = False
         for attempt in range(1, self.retries + 1):
             self._synth_attempts += 1

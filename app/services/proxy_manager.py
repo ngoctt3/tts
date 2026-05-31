@@ -111,11 +111,23 @@ class ProxyManager:
             self._checker_task = None
             self.log.info("Stopped proxy checker background task")
 
-    async def get_proxy(self) -> Union[ProxyItem, NoProxyItem]:
+    async def get_proxy(self, force_real: bool = False) -> Union[ProxyItem, NoProxyItem]:
         async with self._lock:
             if not self._active_pool:
                 # If active pool is empty for some reason, return NO_PROXY fallback
                 return self._no_proxy
+
+            if force_real:
+                real_proxies = [p for p in self._active_pool if not isinstance(p, NoProxyItem)]
+                if real_proxies:
+                    if self.strategy == "shuffle":
+                        return random.choice(real_proxies)
+                    else:  # roundrobin
+                        for idx, item in enumerate(self._active_pool):
+                            if not isinstance(item, NoProxyItem):
+                                self._active_pool.pop(idx)
+                                self._active_pool.append(item)
+                                return item
 
             if self.strategy == "shuffle":
                 return random.choice(self._active_pool)

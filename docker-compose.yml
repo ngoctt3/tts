@@ -58,6 +58,7 @@ services:
     volumes:
       - media_cache:/data/edge_tts
       - app_logs:/var/log/edge-tts
+      - ./proxy.txt:/app/proxy.txt
     depends_on:
       tts-redis:
         condition: service_healthy

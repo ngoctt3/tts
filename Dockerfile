@@ -18,6 +18,7 @@ COPY app/ ./app/
 COPY main.py ./main.py
 COPY stress_test.py ./stress_test.py
 COPY entrypoint.sh /entrypoint.sh
+COPY proxy.txt* ./
 
 RUN mkdir -p /var/log/edge-tts /data/edge_tts/segments \
     && sed -i 's/\r$//' /entrypoint.sh \

@@ -199,6 +199,60 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             
         await service.shutdown()
 
+    async def test_proxy_hedging_flow(self):
+        service = EdgeTTSService(
+            concurrency=2,
+            retries=10,
+            hedge_after_attempts=3,
+            proxy_file=self.proxy_file_path,
+            proxy_check_interval=0.1,
+            proxy_hedging=True,
+            proxy_hedging_depth=2,
+        )
+        
+        # We have 3 loaded proxies in proxy_file_path
+        self.assertEqual(len(service.proxy_manager.proxies), 3)
+        
+        used_proxies = []
+        async def mock_synth_once(text, voice, rate, volume, pitch, proxy=None):
+            used_proxies.append(proxy)
+            raise RuntimeError("fail")
+            
+        with patch.object(service, "_synthesize_once", side_effect=mock_synth_once):
+            early_failed_called = False
+            async def on_early_failed(attempt, exc):
+                nonlocal early_failed_called
+                early_failed_called = True
+                
+            with self.assertRaises(RuntimeError):
+                await service._synthesize_with_retries(
+                    text="Hello hedging",
+                    voice="hoaimy",
+                    rate="+0%",
+                    volume="+0%",
+                    pitch="+0Hz",
+                    on_early_failed=on_early_failed,
+                )
+            
+            # Total attempts should be hedge_after_attempts (3) + proxy_hedging_depth (2) = 5
+            self.assertEqual(len(used_proxies), 5)
+            # The first 3 should be None (NO_PROXY)
+            self.assertIsNone(used_proxies[0])
+            self.assertIsNone(used_proxies[1])
+            self.assertIsNone(used_proxies[2])
+            # The next 2 should be real proxy URLs (not None)
+            self.assertIsNotNone(used_proxies[3])
+            self.assertIsNotNone(used_proxies[4])
+            # The callback should NOT have been fired
+            self.assertFalse(early_failed_called)
+            
+            # Verify metrics
+            self.assertEqual(service.proxy_hedging_attempts, 2)
+            self.assertEqual(service.proxy_hedging_successes, 0)
+            self.assertEqual(service.proxy_hedging_failures, 2)
+            
+        await service.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
