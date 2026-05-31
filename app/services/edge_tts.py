@@ -498,7 +498,7 @@ class EdgeTTSService:
     @staticmethod
     def _latency_summary(values) -> dict:
         if not values:
-            return {"count": 0}
+            return {"count": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "avg": 0.0}
         ordered = sorted(values)
         return {
             "count": len(ordered),

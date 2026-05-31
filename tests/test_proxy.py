@@ -253,6 +253,18 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             
         await service.shutdown()
 
+    def test_empty_latency_metrics_include_percentiles(self):
+        service = EdgeTTSService(proxy_file=self.proxy_file_path)
+        empty_summary = {"count": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "avg": 0.0}
+
+        self.assertEqual(service._latency_summary([]), empty_summary)
+
+        metrics = service.get_metrics()
+        self.assertEqual(metrics["latency_ms"]["queue_wait"], empty_summary)
+        self.assertEqual(metrics["latency_ms"]["synthesize"], empty_summary)
+        self.assertEqual(metrics["latency_ms"]["duration_scan"], empty_summary)
+        self.assertEqual(metrics["latency_ms"]["synthesize"]["p95"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
