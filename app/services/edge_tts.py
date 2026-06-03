@@ -30,7 +30,7 @@ EDGE_TTS_PROXY_CHECK_INTERVAL = float(os.getenv("EDGE_TTS_PROXY_CHECK_INTERVAL",
 EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.me/ip")
 
 # When True: skip proxy entirely and synthesize directly
-EDGE_TTS_DISABLE_PROXY = os.getenv("EDGE_TTS_DISABLE_PROXY", "true").strip().lower() in ("1", "true", "yes")
+EDGE_TTS_DISABLE_PROXY = os.getenv("EDGE_TTS_DISABLE_PROXY", "false").strip().lower() in ("1", "true", "yes")
 
 DEFAULT_PROXY_HEDGING_DEPTH = int(os.getenv("EDGE_TTS_PROXY_HEDGING_DEPTH", "2"))
 
