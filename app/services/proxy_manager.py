@@ -2,10 +2,30 @@ import asyncio
 import os
 import random
 from collections import deque
-from typing import List, Set
+from typing import List, Optional, Set
 import httpx
 
 from app.core.logger import get_logger
+
+
+class DirectProxyItem:
+    """Sentinel proxy item representing a direct (no-proxy) connection."""
+
+    raw = "direct"
+    url: Optional[str] = None
+    is_dead = False
+    fail_count = 0
+    total_requests = 0
+    successful_requests = 0
+    failed_requests = 0
+    latencies: deque = deque(maxlen=1)
+
+    def __repr__(self) -> str:
+        return "DirectProxyItem(direct)"
+
+
+# Shared singleton — avoids creating a new object on every call
+_DIRECT_PROXY = DirectProxyItem()
 
 class ProxyItem:
     def __init__(self, raw: str):
@@ -41,22 +61,24 @@ class ProxyManager:
         strategy: str = "roundrobin",
         check_interval: float = 30.0,
         test_url: str = "http://ipconfig.me/ip",
+        disable_proxy: bool = False,
     ):
         self.proxy_file_path = proxy_file_path
         self.strategy = strategy.lower()
         self.check_interval = check_interval
         self.test_url = test_url
+        # When True: synthesize directly (no proxy) if pool is empty or flag is set
+        self.disable_proxy = disable_proxy
         self.log = get_logger().bind(service="proxy_manager")
-        
+
         self._lock = asyncio.Lock()
-        
-        # Load proxies
+
+        # Load proxies from file (may be empty when disable_proxy=True)
         self.proxies = self.load_proxies()
-        
-        # Active pool contains real proxies only. Direct/no-proxy synthesis is not allowed.
+
         self._active_pool: List[ProxyItem] = list(self.proxies)
         self._dead_proxies: Set[ProxyItem] = set()
-        
+
         self._checker_task: asyncio.Task | None = None
 
     def load_proxies(self) -> List[ProxyItem]:
@@ -96,10 +118,28 @@ class ProxyManager:
             self._checker_task = None
             self.log.info("Stopped proxy checker background task")
 
-    async def get_proxy(self) -> ProxyItem:
+    async def get_proxy(self) -> "ProxyItem | DirectProxyItem":
+        """Return the next proxy from the active pool.
+
+        Falls back to the *direct* sentinel when:
+        - ``disable_proxy`` is True (DISABLE_PROXY env var), OR
+        - The active pool is empty and ``disable_proxy`` is True.
+
+        Raises ``RuntimeError`` when the pool is empty AND ``disable_proxy``
+        is False (original behaviour — keeps the hard failure explicit).
+        """
+        if self.disable_proxy:
+            return _DIRECT_PROXY
+
         async with self._lock:
             if not self._active_pool:
-                raise RuntimeError("No active proxies available")
+                # All proxies are dead → fallback to direct if allowed
+                self.log.warning(
+                    "proxy_pool_exhausted_fallback_direct",
+                    total=len(self.proxies),
+                    dead=len(self._dead_proxies),
+                )
+                return _DIRECT_PROXY
 
             if self.strategy == "shuffle":
                 return random.choice(self._active_pool)
@@ -108,24 +148,28 @@ class ProxyManager:
                 self._active_pool.append(item)
                 return item
 
-    async def report_success(self, proxy: ProxyItem, latency: float = 0.0):
+    async def report_success(self, proxy: "ProxyItem | DirectProxyItem", latency: float = 0.0):
+        if isinstance(proxy, DirectProxyItem):
+            return  # Nothing to track for direct connections
         async with self._lock:
             proxy.total_requests += 1
             proxy.successful_requests += 1
             if latency > 0.0:
                 proxy.latencies.append(latency)
-            
+
             if proxy.fail_count > 0:
                 self.log.debug("Resetting proxy fail count on success", proxy=proxy.raw)
                 proxy.fail_count = 0
 
-    async def report_failure(self, proxy: ProxyItem, latency: float = 0.0):
+    async def report_failure(self, proxy: "ProxyItem | DirectProxyItem", latency: float = 0.0):
+        if isinstance(proxy, DirectProxyItem):
+            return  # Direct connections are not tracked
         async with self._lock:
             proxy.total_requests += 1
             proxy.failed_requests += 1
             if latency > 0.0:
                 proxy.latencies.append(latency)
-            
+
             proxy.fail_count += 1
             self.log.warning("Proxy failed", proxy=proxy.raw, fail_count=proxy.fail_count)
             if proxy.fail_count >= 3:

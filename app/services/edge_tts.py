@@ -8,7 +8,7 @@ from collections import deque
 from typing import Any, Callable
 
 from app.core.logger import get_logger
-from app.services.proxy_manager import ProxyManager
+from app.services.proxy_manager import DirectProxyItem, ProxyManager
 
 
 if sys.platform == "win32":
@@ -28,6 +28,9 @@ EDGE_TTS_PROXY_FILE = os.getenv("EDGE_TTS_PROXY_FILE", "proxy.txt")
 EDGE_TTS_PROXY_STRATEGY = os.getenv("EDGE_TTS_PROXY_STRATEGY", "roundrobin")
 EDGE_TTS_PROXY_CHECK_INTERVAL = float(os.getenv("EDGE_TTS_PROXY_CHECK_INTERVAL", "30.0"))
 EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.me/ip")
+
+# When True: skip proxy entirely and synthesize directly
+EDGE_TTS_DISABLE_PROXY = os.getenv("EDGE_TTS_DISABLE_PROXY", "true").strip().lower() in ("1", "true", "yes")
 
 DEFAULT_PROXY_HEDGING_DEPTH = int(os.getenv("EDGE_TTS_PROXY_HEDGING_DEPTH", "2"))
 
@@ -94,11 +97,13 @@ class EdgeTTSService:
         proxy_check_interval: float = EDGE_TTS_PROXY_CHECK_INTERVAL,
         proxy_test_url: str = EDGE_TTS_PROXY_TEST_URL,
         proxy_hedging_depth: int = DEFAULT_PROXY_HEDGING_DEPTH,
+        disable_proxy: bool = EDGE_TTS_DISABLE_PROXY,
     ):
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
         self.proxy_hedging_depth = max(0, int(proxy_hedging_depth))
+        self.disable_proxy = disable_proxy
 
         self.log = get_logger().bind(service="edge_tts_engine")
         self.proxy_manager = ProxyManager(
@@ -106,6 +111,7 @@ class EdgeTTSService:
             strategy=proxy_strategy,
             check_interval=proxy_check_interval,
             test_url=proxy_test_url,
+            disable_proxy=disable_proxy,
         )
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_loop: asyncio.AbstractEventLoop | None = None
@@ -322,12 +328,12 @@ class EdgeTTSService:
     ) -> bytes:
         """Retry synthesis up to self.retries times.
 
-        Every attempt uses a real proxy from the internal proxy pool. If
-        hedge_after_attempts is configured, the worker uses that attempt budget
-        plus proxy_hedging_depth for internal proxy-pool retries.
+        Every attempt uses a proxy from the internal proxy pool (or direct when
+        DISABLE_PROXY=true / pool is exhausted). When hedge_after_attempts is
+        configured, that budget plus proxy_hedging_depth sets total_attempts.
         """
         self.proxy_manager.start_checker()
-        
+
         if self.hedge_after_attempts > 0:
             total_attempts = self.hedge_after_attempts + self.proxy_hedging_depth
         else:
@@ -337,7 +343,8 @@ class EdgeTTSService:
             self._synth_attempts += 1
             proxy_item = await self.proxy_manager.get_proxy()
             self.proxy_hedging_attempts += 1
-            proxy_url = proxy_item.url
+            # DirectProxyItem.url is None → synthesize without a proxy
+            proxy_url = proxy_item.url if not isinstance(proxy_item, DirectProxyItem) else None
             attempt_start = time.perf_counter()
             try:
                 audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=proxy_url)
@@ -364,11 +371,17 @@ class EdgeTTSService:
                         error=str(exc),
                         proxy=proxy_item.raw,
                     )
+                # on_early_failed callback (sent once when hedge budget is hit)
+                if on_early_failed and self.hedge_after_attempts > 0 and attempt == self.hedge_after_attempts:
+                    try:
+                        await on_early_failed(attempt, exc)
+                    except Exception as cb_exc:
+                        self.log.warning("on_early_failed_callback_error", error=str(cb_exc))
                 if attempt < total_attempts and RETRY_SLEEP_MAX_SECONDS > 0:
                     sleep_min = max(0.0, min(RETRY_SLEEP_MIN_SECONDS, RETRY_SLEEP_MAX_SECONDS))
                     sleep_max = max(sleep_min, RETRY_SLEEP_MAX_SECONDS)
                     await asyncio.sleep(random.uniform(sleep_min, sleep_max))
-        raise RuntimeError(f"Edge TTS failed after {total_attempts} attempt(s) (proxy pool): {last_error}")
+        raise RuntimeError(f"Edge TTS failed after {total_attempts} attempt(s): {last_error}")
 
     async def _synthesize_once(
         self,
