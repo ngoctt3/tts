@@ -22,8 +22,8 @@ from urllib.parse import quote
 
 import httpx
 import redis.asyncio as redis
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from app.core.logger import get_logger
@@ -56,6 +56,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Configuration from environment
 # ──────────────────────────────────────────────────────────────────────
@@ -70,6 +77,7 @@ FORCE_FAIL_SEGMENT_INDEX = _env_int("EDGE_TTS_FORCE_FAIL_SEGMENT_INDEX", -1)
 SEGMENT_META_TTL_SECONDS = _env_int("EDGE_TTS_SEGMENT_META_TTL_SECONDS", 3 * 24 * 3600)
 SEGMENT_LOCK_SECONDS = _env_int("EDGE_TTS_SEGMENT_LOCK_SECONDS", 180)
 METRICS_CACHE_SECONDS = _env_float("EDGE_TTS_METRICS_CACHE_SECONDS", 2.0)
+NATIVE_SEGMENT_X_ACCEL_ENABLED = _env_bool("EDGE_TTS_NATIVE_SEGMENT_X_ACCEL_ENABLED", False)
 
 # Local storage
 LOCAL_DIR = os.getenv("EDGE_TTS_LOCAL_DIR", "/data/edge_tts")
@@ -128,6 +136,9 @@ class LocalDiskStorage:
     def exists(self, key: str) -> bool:
         return self._path_for_key(key).is_file()
 
+    def path(self, key: str) -> Path:
+        return self._path_for_key(key)
+
     def _path_for_key(self, key: str) -> Path:
         clean_key = self._clean_key(key)
         target = (self.root_dir / Path(*clean_key.split("/"))).resolve()
@@ -172,6 +183,8 @@ class TTSSegmentTrace(BaseModel):
     media_index: int
     time_to_play_ms: float
     request_id: str = ""
+    session_id: str = ""
+    chapter_session_id: str = ""
     chain_id: str = ""
     chapter_number: int | None = None
     segment_index: int | None = None
@@ -189,6 +202,7 @@ class TTSSegmentRequest(BaseModel):
     time_to_play_ms: float = 0.0
     trace: TTSSegmentTrace
     webhook_url: str | None = Field(default=None, max_length=2048)
+    demand_webhook_url: str | None = Field(default=None, max_length=2048)
 
 
 class TTSSegmentResponse(BaseModel):
@@ -313,6 +327,11 @@ async def _send_webhook(
                     "edge_tts_webhook_sent",
                     request_id=request_id,
                     cache_key=cache_key,
+                    event_type=payload.get("event_type"),
+                    payload_status=payload.get("status"),
+                    media_index=payload.get("media_index"),
+                    chapter_number=payload.get("chapter_number"),
+                    session_id=payload.get("session_id"),
                     status_code=response.status_code,
                     attempt=attempt,
                 )
@@ -597,6 +616,64 @@ def _track_background_task(task: asyncio.Task) -> None:
     task.add_done_callback(_done)
 
 
+def _safe_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _reserve_segment_demand_event(
+    *,
+    client: redis.Redis,
+    session_id: str,
+    chapter_number: int,
+    media_index: int,
+    cache_key: str,
+) -> bool:
+    key = _segment_demand_key(session_id, chapter_number, media_index, cache_key)
+    return bool(await client.set(key, "1", ex=3, nx=True))
+
+
+def _fire_segment_demand_webhook_background(
+    webhook_url: str | None,
+    *,
+    cache_key: str,
+    session_id: str,
+    chapter_session_id: str,
+    chapter_number: int,
+    media_index: int,
+    request_id: str,
+) -> None:
+    if not webhook_url:
+        return
+    payload = {
+        "event_type": "segment_demand",
+        "status": "demand",
+        "cache_key": cache_key,
+        "session_id": session_id,
+        "chapter_session_id": chapter_session_id,
+        "chapter_number": chapter_number,
+        "media_index": media_index,
+        "provider": "edge-tts",
+        "worker_name": os.getenv("EDGE_TTS_WORKER_NAME", ""),
+    }
+    log.debug(
+        "edge_tts_segment_demand_webhook_scheduled",
+        request_id=request_id,
+        cache_key=cache_key,
+        session_id=session_id,
+        chapter_session_id=chapter_session_id,
+        chapter_number=chapter_number,
+        media_index=media_index,
+        worker_name=payload["worker_name"],
+    )
+    task = asyncio.create_task(
+        _send_webhook(webhook_url, payload, request_id=request_id, cache_key=cache_key)
+    )
+    _track_background_task(task)
+
+
 def _segment_storage_key(cache_key: str) -> str:
     prefix = LOCAL_PREFIX
     if prefix:
@@ -624,6 +701,10 @@ def _segment_meta_key(cache_key: str) -> str:
 
 def _segment_lock_key(cache_key: str) -> str:
     return f"remote_tts:lock:{cache_key}"
+
+
+def _segment_demand_key(session_id: str, chapter_number: int, media_index: int, cache_key: str) -> str:
+    return f"remote_tts:demand:{session_id}:{chapter_number}:{media_index}:{cache_key}"
 
 
 async def _write_segment_meta(client: redis.Redis, cache_key: str, meta: dict[str, Any]) -> None:
@@ -783,6 +864,11 @@ async def _synthesize_segment_to_meta(
             "updated_at": str(int(time.time())),
             "request_id": request_id,
             "trace_id": trace_id,
+            "demand_webhook_url": body.demand_webhook_url or "",
+            "session_id": trace.session_id or "",
+            "chapter_session_id": trace.chapter_session_id or "",
+            "chapter_number": str(trace.chapter_number or ""),
+            "media_index": str(trace.media_index),
         }
         await _write_segment_meta(client, body.cache_key, meta)
         return _segment_response_from_meta(body.cache_key, meta)
@@ -799,6 +885,11 @@ async def _synthesize_segment_to_meta(
             "updated_at": str(int(time.time())),
             "request_id": request_id,
             "trace_id": trace_id,
+            "demand_webhook_url": body.demand_webhook_url or "",
+            "session_id": trace.session_id or "",
+            "chapter_session_id": trace.chapter_session_id or "",
+            "chapter_number": str(trace.chapter_number or ""),
+            "media_index": str(trace.media_index),
         }
         await _write_segment_meta(client, body.cache_key, meta)
         log.warning(
@@ -959,6 +1050,122 @@ async def list_tts_voices():
 @app.get("/api/tts/metrics")
 async def metrics(_: None = Depends(require_internal_token)):
     return _metrics_payload()
+
+
+@app.get("/api/tts/native-segments/{cache_key}.mp3")
+@app.head("/api/tts/native-segments/{cache_key}.mp3")
+async def get_native_tracked_segment(cache_key: str, request: Request):
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{16,128}", cache_key or ""):
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    request_id = _request_id_header(request.headers.get("x-request-id") or "")
+    client = await _segment_redis()
+    meta = await client.hgetall(_segment_meta_key(cache_key))
+    if meta.get("status") != "ready" or not meta.get("url"):
+        log.debug(
+            "edge_tts_native_segment_not_ready",
+            request_id=request_id,
+            cache_key=cache_key,
+            status=meta.get("status"),
+            has_url=bool(meta.get("url")),
+        )
+        raise HTTPException(status_code=404, detail="Segment not ready")
+
+    storage_key = _segment_storage_key(cache_key)
+    try:
+        file_path = await asyncio.to_thread(media_storage.path, storage_key)
+        exists = file_path.is_file()
+    except ValueError:
+        file_path = None
+        exists = False
+    if not exists:
+        log.warning(
+            "edge_tts_native_segment_file_missing",
+            request_id=request_id,
+            cache_key=cache_key,
+            storage_key=storage_key,
+        )
+        raise HTTPException(status_code=404, detail="Segment file missing")
+
+    session_id = str(request.query_params.get("session_id") or meta.get("session_id") or "").strip()
+    chapter_session_id = str(request.query_params.get("chapter_session_id") or meta.get("chapter_session_id") or "").strip()
+    chapter_number = _safe_int(request.query_params.get("chapter_number") or meta.get("chapter_number"), 0)
+    media_index = _safe_int(request.query_params.get("media_index") or meta.get("media_index"), -1)
+    webhook_url = str(meta.get("demand_webhook_url") or "").strip()
+    demand_state = "missing_context"
+    if session_id and chapter_number > 0 and media_index >= 0 and webhook_url:
+        try:
+            reserved = await _reserve_segment_demand_event(
+                client=client,
+                session_id=session_id,
+                chapter_number=chapter_number,
+                media_index=media_index,
+                cache_key=cache_key,
+            )
+            if reserved:
+                demand_state = "emitted"
+                _fire_segment_demand_webhook_background(
+                    webhook_url,
+                    cache_key=cache_key,
+                    session_id=session_id,
+                    chapter_session_id=chapter_session_id,
+                    chapter_number=chapter_number,
+                    media_index=media_index,
+                    request_id=request_id,
+                )
+            else:
+                demand_state = "deduped"
+        except Exception as exc:
+            demand_state = "failed"
+            log.warning(
+                "edge_tts_segment_demand_tracking_failed",
+                request_id=request_id,
+                cache_key=cache_key,
+                session_id=session_id,
+                chapter_number=chapter_number,
+                media_index=media_index,
+                error=str(exc),
+            )
+    elif not webhook_url:
+        demand_state = "missing_webhook"
+
+    accel_path = f"/__edge_tts_media/{quote(storage_key, safe='/')}"
+    serve_mode = "x_accel" if NATIVE_SEGMENT_X_ACCEL_ENABLED else "file"
+    log.debug(
+        "edge_tts_native_segment_served",
+        request_id=request_id,
+        cache_key=cache_key,
+        storage_key=storage_key,
+        file_size=(file_path.stat().st_size if file_path else None),
+        session_id=session_id or None,
+        chapter_session_id=chapter_session_id or None,
+        chapter_number=chapter_number,
+        media_index=media_index,
+        demand_state=demand_state,
+        serve_mode=serve_mode,
+        method=request.method,
+    )
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Accept-Ranges": "bytes",
+        "X-Request-ID": request_id,
+        "X-Edge-TTS-Native-Tracked": "1",
+    }
+    if NATIVE_SEGMENT_X_ACCEL_ENABLED:
+        return Response(
+            status_code=200,
+            media_type="audio/mpeg",
+            headers={
+                **headers,
+                "X-Accel-Redirect": accel_path,
+            },
+        )
+    return FileResponse(
+        path=file_path,
+        media_type="audio/mpeg",
+        headers=headers,
+        filename=f"{cache_key}.mp3",
+    )
 
 
 @app.post("/api/tts/segments", response_model=TTSSegmentResponse)

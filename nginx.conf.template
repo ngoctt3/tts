@@ -90,6 +90,53 @@ http {
         # ──────────────────────────────────────────────────
         # 3. Proxy API requests to FastAPI backend
         # ──────────────────────────────────────────────────
+        # Internal media handoff for native-HLS tracked segment URLs.
+        # FastAPI records demand, then returns X-Accel-Redirect here so Nginx still
+        # serves the MP3 bytes and byte ranges directly.
+        location /__edge_tts_media/ {
+            internal;
+            alias /data/edge_tts/;
+
+            add_header Access-Control-Allow-Origin  $cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
+            add_header Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges" always;
+            add_header Cache-Control "private, no-store" always;
+            add_header Accept-Ranges bytes always;
+
+            types {
+                audio/mpeg mp3;
+            }
+        }
+
+        location /api/tts/native-segments/ {
+            proxy_pass http://fastapi:8100/api/tts/native-segments/;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+            proxy_connect_timeout 10s;
+            proxy_send_timeout    60s;
+            proxy_read_timeout    180s;
+
+            add_header Access-Control-Allow-Origin  $cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range, Accept, Content-Type, X-Request-ID" always;
+            add_header Access-Control-Expose-Headers "Content-Length, Content-Range, Accept-Ranges, X-Request-ID, X-Edge-TTS-Native-Tracked" always;
+
+            if ($request_method = 'OPTIONS') {
+                add_header Access-Control-Allow-Origin  $cors_origin;
+                add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS";
+                add_header Access-Control-Allow-Headers "Range, Accept, Content-Type, X-Request-ID";
+                add_header Access-Control-Max-Age 86400;
+                add_header Content-Length 0;
+                add_header Content-Type text/plain;
+                return 204;
+            }
+        }
+
         location /api/ {
             proxy_pass http://fastapi:8100/api/;
 
@@ -105,12 +152,12 @@ http {
 
             # CORS headers for API
             add_header Access-Control-Allow-Origin  $cors_origin always;
-            add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, POST, OPTIONS" always;
             add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID" always;
 
             if ($request_method = 'OPTIONS') {
                 add_header Access-Control-Allow-Origin  $cors_origin;
-                add_header Access-Control-Allow-Methods "GET, POST, OPTIONS";
+                add_header Access-Control-Allow-Methods "GET, HEAD, POST, OPTIONS";
                 add_header Access-Control-Allow-Headers "Content-Type, X-Internal-Token, X-Request-ID";
                 add_header Access-Control-Max-Age 86400;
                 add_header Content-Length 0;
