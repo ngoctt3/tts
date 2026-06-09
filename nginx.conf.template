@@ -15,6 +15,12 @@ http {
     keepalive_timeout  65;
     client_max_body_size 0;
 
+    # Docker's embedded DNS updates service IPs after container recreation.
+    # Using a variable in proxy_pass makes Nginx resolve FastAPI per DNS TTL
+    # instead of keeping the IP resolved only when Nginx starts.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    resolver_timeout 5s;
+
     # Gzip for JSON API responses
     gzip on;
     gzip_types application/json;
@@ -36,12 +42,14 @@ http {
         listen 80;
         server_name _;
 
+        set $fastapi_upstream http://fastapi:8100;
+
         # ──────────────────────────────────────────────────
         # 1. Health check (for load balancers / monitoring)
         # ──────────────────────────────────────────────────
         location = /health {
             access_log off;
-            proxy_pass http://fastapi:8100/health;
+            proxy_pass $fastapi_upstream/health;
 
             proxy_set_header Host              $host;
             proxy_set_header X-Real-IP         $remote_addr;
@@ -110,7 +118,7 @@ http {
         }
 
         location /api/tts/native-segments/ {
-            proxy_pass http://fastapi:8100/api/tts/native-segments/;
+            proxy_pass $fastapi_upstream/api/tts/native-segments/;
 
             proxy_set_header Host              $host;
             proxy_set_header X-Real-IP         $remote_addr;
@@ -138,7 +146,7 @@ http {
         }
 
         location /api/ {
-            proxy_pass http://fastapi:8100/api/;
+            proxy_pass $fastapi_upstream/api/;
 
             proxy_set_header Host              $host;
             proxy_set_header X-Real-IP         $remote_addr;

@@ -67,9 +67,8 @@ services:
       tts-redis:
         condition: service_healthy
     networks:
-      - dokploy-network
-      - truyendich-network
       - default
+      - truyendich-network
     restart: always
     deploy:
       resources:
@@ -116,13 +115,13 @@ services:
       - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - media_cache:/data/edge_tts:ro
     depends_on:
-      - fastapi
+      fastapi:
+        condition: service_healthy
     restart: always
     ports:
       - "8080:80"
     networks:
       - dokploy-network
-      - truyendich-network
       - default
     deploy:
       resources:
