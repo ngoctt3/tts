@@ -170,6 +170,17 @@ class ProxyManager:
             if latency > 0.0:
                 proxy.latencies.append(latency)
 
+            # A single configured endpoint may be a rotating proxy gateway.
+            # One failed exit IP must not remove the only usable endpoint.
+            if len(self.proxies) == 1:
+                proxy.fail_count = 0
+                proxy.is_dead = False
+                self._dead_proxies.discard(proxy)
+                if proxy not in self._active_pool:
+                    self._active_pool.append(proxy)
+                self.log.warning("Single rotating proxy failed; keeping it active", proxy=proxy.raw)
+                return
+
             proxy.fail_count += 1
             self.log.warning("Proxy failed", proxy=proxy.raw, fail_count=proxy.fail_count)
             if proxy.fail_count >= 3:

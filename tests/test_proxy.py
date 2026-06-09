@@ -125,6 +125,62 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pm._active_pool), 3)
         self.assertEqual(len(pm._dead_proxies), 0)
 
+    async def test_single_rotating_proxy_is_never_marked_dead_and_is_reused(self):
+        single_proxy_file = os.path.join(self.temp_dir.name, "single_proxy.txt")
+        with open(single_proxy_file, "w", encoding="utf-8") as f:
+            f.write("rotating-proxy.example:8080:user:password\n")
+
+        pm = ProxyManager(proxy_file_path=single_proxy_file)
+        proxy = pm.proxies[0]
+
+        for _ in range(10):
+            selected = await pm.get_proxy()
+            self.assertIs(selected, proxy)
+            await pm.report_failure(selected)
+
+        self.assertFalse(proxy.is_dead)
+        self.assertEqual(proxy.fail_count, 0)
+        self.assertEqual(proxy.failed_requests, 10)
+        self.assertEqual(pm._active_pool, [proxy])
+        self.assertEqual(len(pm._dead_proxies), 0)
+
+        self.assertIs(await pm.get_proxy(), proxy)
+
+    async def test_single_rotating_proxy_is_reused_across_synthesis_retries(self):
+        single_proxy_file = os.path.join(self.temp_dir.name, "single_proxy_retries.txt")
+        with open(single_proxy_file, "w", encoding="utf-8") as f:
+            f.write("rotating-proxy.example:8080:user:password\n")
+
+        service = EdgeTTSService(
+            retries=10,
+            hedge_after_attempts=3,
+            proxy_hedging_depth=2,
+            proxy_file=single_proxy_file,
+        )
+        used_proxies = []
+
+        async def mock_synth_once(text, voice, rate, volume, pitch, proxy=None):
+            used_proxies.append(proxy)
+            raise RuntimeError("rotating exit failed")
+
+        with patch.object(service, "_synthesize_once", side_effect=mock_synth_once):
+            with self.assertRaises(RuntimeError):
+                await service._synthesize_with_retries(
+                    text="Hello rotating proxy",
+                    voice="hoaimy",
+                    rate="+0%",
+                    volume="+0%",
+                    pitch="+0Hz",
+                )
+
+        proxy = service.proxy_manager.proxies[0]
+        self.assertEqual(len(used_proxies), 5)
+        self.assertEqual(set(used_proxies), {proxy.url})
+        self.assertFalse(proxy.is_dead)
+        self.assertEqual(service.proxy_manager._active_pool, [proxy])
+        self.assertEqual(len(service.proxy_manager._dead_proxies), 0)
+        await service.shutdown()
+
     async def test_raises_when_all_proxies_dead(self):
         pm = ProxyManager(proxy_file_path=self.proxy_file_path)
         
