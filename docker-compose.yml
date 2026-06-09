@@ -83,7 +83,7 @@ services:
   tts-redis:
     image: redis:7-alpine
     container_name: tts-redis
-    command: redis-server --appendonly yes --maxmemory 64mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     networks:
@@ -97,7 +97,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 100M
+          memory: 512M
         reservations:
           memory: 16M
 
