@@ -10,7 +10,7 @@ import httpx
 # Ensure root directory is in python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.proxy_manager import ProxyItem, ProxyManager
+from app.services.proxy_manager import DirectProxyItem, ProxyItem, ProxyManager
 from app.services.edge_tts import EdgeTTSService
 
 
@@ -78,6 +78,34 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         chosen = [await pm_sh.get_proxy() for _ in range(20)]
         # Ensure we got real proxy choices only.
         self.assertTrue(any(x.raw == "198.105.121.200:6462" for x in chosen))
+
+    async def test_proxy_selection_excludes_attempted_proxies(self):
+        attempted = set()
+        pm_rr = ProxyManager(proxy_file_path=self.proxy_file_path, strategy="roundrobin")
+        for _ in range(3):
+            proxy = await pm_rr.get_proxy(exclude_urls=attempted)
+            self.assertNotIn(proxy.url, attempted)
+            attempted.add(proxy.url)
+
+    async def test_proxy_selection_excludes_duplicate_urls(self):
+        duplicate_file = os.path.join(self.temp_dir.name, "duplicate_proxies.txt")
+        with open(duplicate_file, "w", encoding="utf-8") as f:
+            f.write("192.0.2.1:8080\n")
+            f.write("192.0.2.1:8080\n")
+            f.write("192.0.2.2:8080\n")
+
+        pm = ProxyManager(proxy_file_path=duplicate_file, strategy="roundrobin")
+        first = await pm.get_proxy()
+        second = await pm.get_proxy(exclude_urls={first.url})
+
+        self.assertNotEqual(first.url, second.url)
+
+        attempted = set()
+        pm_sh = ProxyManager(proxy_file_path=self.proxy_file_path, strategy="shuffle")
+        for _ in range(3):
+            proxy = await pm_sh.get_proxy(exclude_urls=attempted)
+            self.assertNotIn(proxy.url, attempted)
+            attempted.add(proxy.url)
 
     async def test_failure_threshold_and_revival(self):
         pm = ProxyManager(proxy_file_path=self.proxy_file_path, check_interval=0.05)
@@ -156,6 +184,7 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             hedge_after_attempts=3,
             proxy_hedging_depth=2,
             proxy_file=single_proxy_file,
+            direct_fallback_enabled=False,
         )
         used_proxies = []
 
@@ -181,7 +210,7 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(service.proxy_manager._dead_proxies), 0)
         await service.shutdown()
 
-    async def test_raises_when_all_proxies_dead(self):
+    async def test_falls_back_to_direct_when_all_proxies_dead(self):
         pm = ProxyManager(proxy_file_path=self.proxy_file_path)
         
         # Mark all loaded proxies as dead
@@ -192,8 +221,7 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             
         self.assertEqual(len(pm._active_pool), 0)
         
-        with self.assertRaisesRegex(RuntimeError, "No active proxies available"):
-            await pm.get_proxy()
+        self.assertIsInstance(await pm.get_proxy(), DirectProxyItem)
 
     async def test_edge_tts_integration(self):
         service = EdgeTTSService(
@@ -225,13 +253,59 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(audio, b"dummyaudio" * 100)
             self.assertEqual(call_count, 4)
-            self.assertTrue(all(proxy is not None for proxy in used_proxies))
+            self.assertEqual(len(set(used_proxies[:-1])), 3)
+            self.assertTrue(all(proxy is not None for proxy in used_proxies[:-1]))
+            self.assertIsNone(used_proxies[-1])
             
-        # Ensure all attempts were recorded against real proxies.
-        self.assertEqual(sum(proxy.total_requests for proxy in service.proxy_manager.proxies), 4)
+        # Direct fallback is tracked separately from real proxy attempts.
+        self.assertEqual(sum(proxy.total_requests for proxy in service.proxy_manager.proxies), 3)
         self.assertEqual(sum(proxy.failed_requests for proxy in service.proxy_manager.proxies), 3)
+        self.assertEqual(service.direct_fallback_attempts, 1)
+        self.assertEqual(service.direct_fallback_successes, 1)
             
         await service.shutdown()
+
+    async def test_final_attempt_falls_back_to_direct(self):
+        proxy_file = os.path.join(self.temp_dir.name, "six_proxies.txt")
+        with open(proxy_file, "w", encoding="utf-8") as f:
+            for index in range(1, 7):
+                f.write(f"192.0.2.{index}:8080\n")
+
+        for strategy in ("roundrobin", "shuffle"):
+            service = EdgeTTSService(
+                retries=6,
+                hedge_after_attempts=0,
+                proxy_file=proxy_file,
+                proxy_strategy=strategy,
+                direct_fallback_enabled=True,
+                direct_fallback_concurrency=1,
+            )
+            used_proxies = []
+
+            async def mock_synth_once(text, voice, rate, volume, pitch, proxy=None):
+                used_proxies.append(proxy)
+                if proxy is not None:
+                    raise RuntimeError("proxy failed")
+                return b"dummyaudio" * 100
+
+            with patch.object(service, "_synthesize_once", side_effect=mock_synth_once):
+                audio = await service._synthesize_with_retries(
+                    text="Hello direct fallback",
+                    voice="hoaimy",
+                    rate="+0%",
+                    volume="+0%",
+                    pitch="+0Hz",
+                )
+
+            self.assertEqual(audio, b"dummyaudio" * 100)
+            self.assertEqual(len(used_proxies), 6)
+            self.assertEqual(len(set(used_proxies[:-1])), 5)
+            self.assertTrue(all(proxy is not None for proxy in used_proxies[:-1]))
+            self.assertIsNone(used_proxies[-1])
+            self.assertEqual(service.direct_fallback_attempts, 1)
+            self.assertEqual(service.direct_fallback_successes, 1)
+            self.assertEqual(service.direct_fallback_failures, 0)
+            await service.shutdown()
 
     async def test_proxy_hedging_flow(self):
         service = EdgeTTSService(
@@ -241,6 +315,7 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             proxy_file=self.proxy_file_path,
             proxy_check_interval=0.1,
             proxy_hedging_depth=2,
+            direct_fallback_enabled=False,
         )
         
         # We have 3 loaded proxies in proxy_file_path
@@ -271,8 +346,8 @@ class TestProxyManager(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(used_proxies), 5)
             # All attempts should use real proxy URLs.
             self.assertTrue(all(proxy is not None for proxy in used_proxies))
-            # The callback should NOT have been fired
-            self.assertFalse(early_failed_called)
+            # The callback fires once at the configured early-failure threshold.
+            self.assertTrue(early_failed_called)
             
             # Verify metrics
             self.assertEqual(service.proxy_hedging_attempts, 5)

@@ -118,7 +118,7 @@ class ProxyManager:
             self._checker_task = None
             self.log.info("Stopped proxy checker background task")
 
-    async def get_proxy(self) -> "ProxyItem | DirectProxyItem":
+    async def get_proxy(self, exclude_urls: Optional[Set[str]] = None) -> "ProxyItem | DirectProxyItem":
         """Return the next proxy from the active pool.
 
         Falls back to the *direct* sentinel when:
@@ -141,12 +141,25 @@ class ProxyManager:
                 )
                 return _DIRECT_PROXY
 
+            eligible = [item for item in self._active_pool if item.url not in (exclude_urls or set())]
+            if not eligible:
+                eligible = list(self._active_pool)
+                self.log.warning(
+                    "proxy_request_unique_pool_exhausted",
+                    active=len(self._active_pool),
+                    excluded_urls=len(exclude_urls or set()),
+                )
+
             if self.strategy == "shuffle":
-                return random.choice(self._active_pool)
+                return random.choice(eligible)
             else:  # roundrobin
-                item = self._active_pool.pop(0)
-                self._active_pool.append(item)
-                return item
+                for _ in range(len(self._active_pool)):
+                    item = self._active_pool.pop(0)
+                    self._active_pool.append(item)
+                    if item in eligible:
+                        return item
+
+                return eligible[0]
 
     async def report_success(self, proxy: "ProxyItem | DirectProxyItem", latency: float = 0.0):
         if isinstance(proxy, DirectProxyItem):

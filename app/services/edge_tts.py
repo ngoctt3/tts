@@ -16,10 +16,10 @@ if sys.platform == "win32":
 
 
 DEFAULT_TTS_CONCURRENCY = int(os.getenv("EDGE_TTS_CONCURRENCY", "64"))
-DEFAULT_TTS_RETRIES = int(os.getenv("EDGE_TTS_RETRIES", "10"))
-DEFAULT_HEDGE_AFTER_ATTEMPTS = int(os.getenv("EDGE_TTS_HEDGE_AFTER_ATTEMPTS", "4"))
+DEFAULT_TTS_RETRIES = int(os.getenv("EDGE_TTS_RETRIES", "6"))
+DEFAULT_HEDGE_AFTER_ATTEMPTS = int(os.getenv("EDGE_TTS_HEDGE_AFTER_ATTEMPTS", "0"))
 DEFAULT_CONNECT_TIMEOUT = int(os.getenv("EDGE_TTS_CONNECT_TIMEOUT", "4"))
-DEFAULT_RECEIVE_TIMEOUT = int(os.getenv("EDGE_TTS_RECEIVE_TIMEOUT", "15"))
+DEFAULT_RECEIVE_TIMEOUT = int(os.getenv("EDGE_TTS_RECEIVE_TIMEOUT", "20"))
 RETRY_SLEEP_MIN_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MIN_SECONDS", "0.1"))
 RETRY_SLEEP_MAX_SECONDS = float(os.getenv("EDGE_TTS_RETRY_SLEEP_MAX_SECONDS", "0.2"))
 METRICS_SAMPLE_SIZE = int(os.getenv("EDGE_TTS_METRICS_SAMPLE_SIZE", "1000"))
@@ -31,8 +31,10 @@ EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.
 
 # When True: skip proxy entirely and synthesize directly
 EDGE_TTS_DISABLE_PROXY = os.getenv("EDGE_TTS_DISABLE_PROXY", "false").strip().lower() in ("1", "true", "yes")
+EDGE_TTS_DIRECT_FALLBACK_ENABLED = os.getenv("EDGE_TTS_DIRECT_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+DEFAULT_DIRECT_FALLBACK_CONCURRENCY = int(os.getenv("EDGE_TTS_DIRECT_FALLBACK_CONCURRENCY", "2"))
 
-DEFAULT_PROXY_HEDGING_DEPTH = int(os.getenv("EDGE_TTS_PROXY_HEDGING_DEPTH", "2"))
+DEFAULT_PROXY_HEDGING_DEPTH = int(os.getenv("EDGE_TTS_PROXY_HEDGING_DEPTH", "3"))
 
 
 VOICE_ALIASES = {
@@ -98,12 +100,17 @@ class EdgeTTSService:
         proxy_test_url: str = EDGE_TTS_PROXY_TEST_URL,
         proxy_hedging_depth: int = DEFAULT_PROXY_HEDGING_DEPTH,
         disable_proxy: bool = EDGE_TTS_DISABLE_PROXY,
+        direct_fallback_enabled: bool = EDGE_TTS_DIRECT_FALLBACK_ENABLED,
+        direct_fallback_concurrency: int = DEFAULT_DIRECT_FALLBACK_CONCURRENCY,
     ):
         self.concurrency = max(1, int(concurrency))
         self.retries = max(1, int(retries))
         self.hedge_after_attempts = max(0, int(hedge_after_attempts))
         self.proxy_hedging_depth = max(0, int(proxy_hedging_depth))
         self.disable_proxy = disable_proxy
+        self.direct_fallback_enabled = bool(direct_fallback_enabled)
+        self.direct_fallback_concurrency = max(1, int(direct_fallback_concurrency))
+        self._direct_fallback_semaphore = asyncio.Semaphore(self.direct_fallback_concurrency)
 
         self.log = get_logger().bind(service="edge_tts_engine")
         self.proxy_manager = ProxyManager(
@@ -130,6 +137,9 @@ class EdgeTTSService:
         self.proxy_hedging_attempts = 0
         self.proxy_hedging_successes = 0
         self.proxy_hedging_failures = 0
+        self.direct_fallback_attempts = 0
+        self.direct_fallback_successes = 0
+        self.direct_fallback_failures = 0
         self._queue_wait_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._synth_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
         self._duration_ms = deque(maxlen=METRICS_SAMPLE_SIZE)
@@ -259,6 +269,11 @@ class EdgeTTSService:
                 "hedging_attempts": self.proxy_hedging_attempts,
                 "hedging_successes": self.proxy_hedging_successes,
                 "hedging_failures": self.proxy_hedging_failures,
+                "direct_fallback_enabled": self.direct_fallback_enabled,
+                "direct_fallback_concurrency": self.direct_fallback_concurrency,
+                "direct_fallback_attempts": self.direct_fallback_attempts,
+                "direct_fallback_successes": self.direct_fallback_successes,
+                "direct_fallback_failures": self.direct_fallback_failures,
                 "details": [
                     {
                         "raw": p.raw,
@@ -339,20 +354,52 @@ class EdgeTTSService:
         else:
             total_attempts = self.retries
         last_error = None
+        attempted_proxy_urls = set()
         for attempt in range(1, total_attempts + 1):
             self._synth_attempts += 1
-            proxy_item = await self.proxy_manager.get_proxy()
+            use_direct_fallback = (
+                self.direct_fallback_enabled
+                and not self.disable_proxy
+                and bool(self.proxy_manager.proxies)
+                and total_attempts > 1
+                and attempt == total_attempts
+            )
+            proxy_item = (
+                DirectProxyItem()
+                if use_direct_fallback
+                else await self.proxy_manager.get_proxy(exclude_urls=attempted_proxy_urls)
+            )
+            if not isinstance(proxy_item, DirectProxyItem):
+                attempted_proxy_urls.add(proxy_item.url)
             self.proxy_hedging_attempts += 1
             # DirectProxyItem.url is None → synthesize without a proxy
             proxy_url = proxy_item.url if not isinstance(proxy_item, DirectProxyItem) else None
             attempt_start = time.perf_counter()
             try:
-                audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=proxy_url)
+                if use_direct_fallback:
+                    self.direct_fallback_attempts += 1
+                    self.log.warning(
+                        "edge_tts_direct_fallback_attempt",
+                        attempt=attempt,
+                        max_attempts=total_attempts,
+                        direct_fallback_concurrency=self.direct_fallback_concurrency,
+                    )
+                    async with self._direct_fallback_semaphore:
+                        audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=None)
+                else:
+                    audio = await self._synthesize_once(text, voice, rate, volume, pitch, proxy=proxy_url)
                 if len(audio) < 512:
                     raise RuntimeError("Edge TTS returned an empty audio segment")
                 attempt_latency = time.perf_counter() - attempt_start
                 await self.proxy_manager.report_success(proxy_item, attempt_latency)
                 self.proxy_hedging_successes += 1
+                if use_direct_fallback:
+                    self.direct_fallback_successes += 1
+                    self.log.info(
+                        "edge_tts_direct_fallback_succeeded",
+                        attempt=attempt,
+                        max_attempts=total_attempts,
+                    )
                 return audio
             except Exception as exc:
                 last_error = exc
@@ -360,6 +407,14 @@ class EdgeTTSService:
                 attempt_latency = time.perf_counter() - attempt_start
                 await self.proxy_manager.report_failure(proxy_item, attempt_latency)
                 self.proxy_hedging_failures += 1
+                if use_direct_fallback:
+                    self.direct_fallback_failures += 1
+                    self.log.warning(
+                        "edge_tts_direct_fallback_failed",
+                        attempt=attempt,
+                        max_attempts=total_attempts,
+                        error=str(exc),
+                    )
                 if attempt >= 7:
                     self.log.warning(
                         "edge_tts_synthesize_attempt_failed",

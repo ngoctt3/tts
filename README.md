@@ -141,7 +141,7 @@ Nginx will be exposed on port `80` (or the port defined in `docker-compose.yml`)
   "url": null,
   "duration": null,
   "bytes": null,
-  "attempts": 4,
+  "attempts": 3,
   "provider": "edge-tts",
   "voice": null,
   "duration_source": null,
@@ -200,7 +200,7 @@ The service implements a **hedging** strategy to improve reliability across mult
 ```
 
 1. The orchestrator sends a TTS request to **Worker A**.
-2. Worker A tries `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` times (default: 4).
+2. Worker A tries `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` times when early-failure hedging is enabled.
 3. If all attempts fail, Worker A returns `status: "early_failed"` (HTTP 200) and fires the webhook with the same status.
 4. The orchestrator receives `early_failed` and **re-dispatches** the same segment to **Worker B** (a different node).
 5. Worker B processes the request independently.
@@ -208,7 +208,9 @@ The service implements a **hedging** strategy to improve reliability across mult
 ### Key behaviors:
 - `early_failed` response uses HTTP **200** (not 5xx), so load balancers don't mark the worker as unhealthy.
 - The Redis cache key for `early_failed` segments has a **short TTL (60s)**, so the next worker won't see a stale cached failure.
-- If `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` is set to `0` or is `>= EDGE_TTS_RETRIES`, hedging is disabled and the worker retries all attempts locally.
+- Early-failure hedging is disabled by default because workers share the same proxy pool.
+- Each synthesis request avoids reusing a proxy until all active proxies have been tried.
+- With the default settings, attempts 1-5 use different proxies and attempt 6 uses the local IP.
 
 ---
 
@@ -250,7 +252,10 @@ python scripts/stress_remote_edge_tts.py --url http://127.0.0.1:8080 --token tes
 | `EDGE_TTS_MAX_SEGMENT_CHARS` | `8000` | Maximum character length allowed for a single segment |
 | `EDGE_TTS_CLEANUP_MAX_AGE_SECONDS` | `259200` (3 days) | Expiry limit for audio files deletion |
 | `EDGE_TTS_CLEANUP_INTERVAL_SECONDS` | `3600` (1 hour) | Cleanup scan interval |
-| `EDGE_TTS_RETRIES` | `10` | Maximum local synthesis retry attempts before giving up |
-| `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` | `4` | After this many failed attempts, return `early_failed` so the orchestrator can hedge on another worker. Set to `0` to disable hedging. |
+| `EDGE_TTS_RETRIES` | `6` | Total attempt budget when early-failure hedging is disabled. |
+| `EDGE_TTS_HEDGE_AFTER_ATTEMPTS` | `0` | After this many failed attempts, return `early_failed`; disabled by default. |
+| `EDGE_TTS_PROXY_HEDGING_DEPTH` | `3` | Additional attempts only when early-failure hedging is enabled. |
+| `EDGE_TTS_DIRECT_FALLBACK_ENABLED` | `true` | Use the local IP for the final synthesis attempt after proxy attempts fail. |
+| `EDGE_TTS_DIRECT_FALLBACK_CONCURRENCY` | `2` | Maximum concurrent final-attempt syntheses through the local IP. |
 | `EDGE_TTS_WEBHOOK_TIMEOUT` | `10` | Webhook HTTP timeout (seconds) |
 | `EDGE_TTS_WEBHOOK_MAX_RETRIES` | `5` | Maximum attempts for webhook delivery |
