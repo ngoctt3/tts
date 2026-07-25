@@ -112,7 +112,7 @@ services:
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
       NGINX_ENVSUBST_FILTER: ALLOW_ORIGIN
-      ALLOW_ORIGIN: "${ALLOW_ORIGIN:-(https://truyendich.live|https://truyendich.vip|https://truyendich.ai|https://truyendich.store|http://localhost:3000|https?://.*\\.trycloudflare\\.com)}"
+      ALLOW_ORIGIN: "${ALLOW_ORIGIN:-.*}"
     volumes:
       - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - media_cache:/data/edge_tts:ro
