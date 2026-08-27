@@ -62,6 +62,8 @@ class ProxyManager:
         check_interval: float = 30.0,
         test_url: str = "http://ipconfig.me/ip",
         disable_proxy: bool = False,
+        remote_url: Optional[str] = None,
+        refresh_interval: float = 14400.0,
     ):
         self.proxy_file_path = proxy_file_path
         self.strategy = strategy.lower()
@@ -69,17 +71,23 @@ class ProxyManager:
         self.test_url = test_url
         # When True: synthesize directly (no proxy) if pool is empty or flag is set
         self.disable_proxy = disable_proxy
+        # Remote endpoint that returns fresh proxy line(s); refreshed periodically
+        self.remote_url = (remote_url or "").strip() or None
+        self.refresh_interval = refresh_interval
         self.log = get_logger().bind(service="proxy_manager")
 
         self._lock = asyncio.Lock()
 
-        # Load proxies from file (may be empty when disable_proxy=True)
+        # Load proxies from file (may be empty when disable_proxy=True). When a
+        # remote_url is configured the file acts only as a startup fallback until
+        # the first successful remote refresh replaces the pool.
         self.proxies = self.load_proxies()
 
         self._active_pool: List[ProxyItem] = list(self.proxies)
         self._dead_proxies: Set[ProxyItem] = set()
 
         self._checker_task: asyncio.Task | None = None
+        self._refresher_task: asyncio.Task | None = None
 
     def load_proxies(self) -> List[ProxyItem]:
         if not self.proxy_file_path or not os.path.exists(self.proxy_file_path):
@@ -117,6 +125,90 @@ class ProxyManager:
                 pass
             self._checker_task = None
             self.log.info("Stopped proxy checker background task")
+
+    def start_refresher(self):
+        """Start the periodic remote-proxy refresh background task (no-op when
+        no remote_url is configured)."""
+        if not self.remote_url:
+            return
+        if self._refresher_task is None or self._refresher_task.done():
+            self._refresher_task = asyncio.create_task(
+                self._refresh_proxies_loop(), name="proxy-refresher-task"
+            )
+            self.log.info(
+                "Started proxy refresher background task",
+                url=self.remote_url,
+                interval=self.refresh_interval,
+            )
+
+    async def stop_refresher(self):
+        if self._refresher_task is not None:
+            self._refresher_task.cancel()
+            try:
+                await self._refresher_task
+            except asyncio.CancelledError:
+                pass
+            self._refresher_task = None
+            self.log.info("Stopped proxy refresher background task")
+
+    def _parse_proxy_text(self, text: str) -> List[ProxyItem]:
+        parsed: List[ProxyItem] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                try:
+                    parsed.append(ProxyItem(line))
+                except Exception as e:
+                    self.log.error("Failed to parse remote proxy line", line=line, error=str(e))
+        return parsed
+
+    async def refresh_from_remote(self) -> bool:
+        """Fetch fresh proxies from ``remote_url`` and atomically swap the pool.
+
+        Returns True when the pool was replaced with at least one proxy, False
+        otherwise (network error, empty/unparseable body). On failure the
+        existing pool is left untouched so synthesis keeps working.
+        """
+        if not self.remote_url:
+            return False
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(self.remote_url)
+                response.raise_for_status()
+                text = response.text
+        except Exception as e:
+            self.log.error("Failed to fetch remote proxies", url=self.remote_url, error=str(e))
+            return False
+
+        new_proxies = self._parse_proxy_text(text)
+        if not new_proxies:
+            self.log.warning("Remote proxy response yielded no usable proxies", url=self.remote_url)
+            return False
+
+        async with self._lock:
+            self.proxies = new_proxies
+            self._active_pool = list(new_proxies)
+            self._dead_proxies = set()
+
+        self.log.success(
+            "Refreshed proxies from remote endpoint",
+            count=len(new_proxies),
+            url=self.remote_url,
+        )
+        return True
+
+    async def _refresh_proxies_loop(self):
+        # Refresh immediately on start, then every ``refresh_interval`` seconds.
+        while True:
+            try:
+                await self.refresh_from_remote()
+                await asyncio.sleep(self.refresh_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.log.error("Error in proxy refresher loop", error=str(e))
+                await asyncio.sleep(self.refresh_interval)
 
     async def get_proxy(self, exclude_urls: Optional[Set[str]] = None) -> "ProxyItem | DirectProxyItem":
         """Return the next proxy from the active pool.

@@ -1,1 +1,1 @@
-datacenter-us.floxy.io:1338:IPv4D_FrmPbUIgEG-ttl-0:4hEhnpK1JC5rYY4
+datacenter-us.floxy.io:1338:IPv4D_FaugXrASlc-ttl-0:LgZ4LgFRMrguWLm

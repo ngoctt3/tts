@@ -29,6 +29,16 @@ EDGE_TTS_PROXY_STRATEGY = os.getenv("EDGE_TTS_PROXY_STRATEGY", "roundrobin")
 EDGE_TTS_PROXY_CHECK_INTERVAL = float(os.getenv("EDGE_TTS_PROXY_CHECK_INTERVAL", "30.0"))
 EDGE_TTS_PROXY_TEST_URL = os.getenv("EDGE_TTS_PROXY_TEST_URL", "http://ipconfig.me/ip")
 
+# Remote endpoint that returns fresh proxy line(s). When set, the pool is
+# refreshed from it periodically (default every 4 hours) instead of requiring a
+# redeploy after editing proxy.txt.
+EDGE_TTS_PROXY_REMOTE_URL = os.getenv(
+    "EDGE_TTS_PROXY_REMOTE_URL", "https://proxy.g1-api-gateway.workers.dev/"
+).strip()
+EDGE_TTS_PROXY_REFRESH_INTERVAL = float(
+    os.getenv("EDGE_TTS_PROXY_REFRESH_INTERVAL", str(4 * 60 * 60))
+)
+
 # When True: skip proxy entirely and synthesize directly
 EDGE_TTS_DISABLE_PROXY = os.getenv("EDGE_TTS_DISABLE_PROXY", "false").strip().lower() in ("1", "true", "yes")
 EDGE_TTS_DIRECT_FALLBACK_ENABLED = os.getenv("EDGE_TTS_DIRECT_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
@@ -98,6 +108,8 @@ class EdgeTTSService:
         proxy_strategy: str = EDGE_TTS_PROXY_STRATEGY,
         proxy_check_interval: float = EDGE_TTS_PROXY_CHECK_INTERVAL,
         proxy_test_url: str = EDGE_TTS_PROXY_TEST_URL,
+        proxy_remote_url: str = EDGE_TTS_PROXY_REMOTE_URL,
+        proxy_refresh_interval: float = EDGE_TTS_PROXY_REFRESH_INTERVAL,
         proxy_hedging_depth: int = DEFAULT_PROXY_HEDGING_DEPTH,
         disable_proxy: bool = EDGE_TTS_DISABLE_PROXY,
         direct_fallback_enabled: bool = EDGE_TTS_DIRECT_FALLBACK_ENABLED,
@@ -119,6 +131,8 @@ class EdgeTTSService:
             check_interval=proxy_check_interval,
             test_url=proxy_test_url,
             disable_proxy=disable_proxy,
+            remote_url=proxy_remote_url,
+            refresh_interval=proxy_refresh_interval,
         )
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_loop: asyncio.AbstractEventLoop | None = None
@@ -241,6 +255,7 @@ class EdgeTTSService:
         self._queue = None
         self._worker_loop = None
         await self.proxy_manager.stop_checker()
+        await self.proxy_manager.stop_refresher()
 
     def get_metrics(self, *, include_cache: bool = False) -> dict:
         total_jobs = self._completed_jobs + self._failed_jobs
@@ -305,6 +320,7 @@ class EdgeTTSService:
         if self._queue is not None and self._worker_loop is loop and len(alive) == self.concurrency:
             self._worker_tasks = alive
             self.proxy_manager.start_checker()
+            self.proxy_manager.start_refresher()
             return
         for task in alive:
             task.cancel()
@@ -314,6 +330,7 @@ class EdgeTTSService:
         self._worker_loop = loop
         self._worker_tasks = [asyncio.create_task(self._queue_worker(index), name=f"edge-tts-worker-{index}") for index in range(self.concurrency)]
         self.proxy_manager.start_checker()
+        self.proxy_manager.start_refresher()
 
     async def _queue_worker(self, worker_index: int) -> None:
         while True:
@@ -348,6 +365,7 @@ class EdgeTTSService:
         configured, that budget plus proxy_hedging_depth sets total_attempts.
         """
         self.proxy_manager.start_checker()
+        self.proxy_manager.start_refresher()
 
         if self.hedge_after_attempts > 0:
             total_attempts = self.hedge_after_attempts + self.proxy_hedging_depth
